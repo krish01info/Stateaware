@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment / secrets
+.env
+.env.*
+*.key
+
+# SQLite databases (generated at runtime)
+*.db
+*.sqlite
+*.sqlite3
+
+# Evaluation results (regenerate with harness)
+harness/results/
+harness/models.txt
+harness/models_list.txt
+harness/smoke_output.txt
+
+# Dataset exploration dumps
+stale_explore.json
+
+# Gemini/agent artifacts
+.gemini/
