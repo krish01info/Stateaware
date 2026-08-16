@@ -1,4 +1,4 @@
-<h1 align="center">🛡️ StateGuard</h1>
+<h1 align="center">🛡️ Stateaware</h1>
 
 <p align="center">
   <b>Pre-hoc Interception of Stale-Memory Queries in AI Agents</b><br>
