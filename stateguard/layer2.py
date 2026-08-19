@@ -188,7 +188,7 @@ def _call_mock(system: str, user: str) -> str:
     corrected = None
     if is_stale:
         # Extract the query line to rewrite it
-        match = re.search(r"User query: (.+)", user)
+        match = re.search(r"USER QUERY: (.+)", user, re.IGNORECASE)
         if match:
             corrected = match.group(1).replace("vegetarian", "vegan")
     return json.dumps({
@@ -257,7 +257,12 @@ def check_l2(
         return layer1_result
 
     provider = provider or os.environ.get("STATEGUARD_LLM", "gemini")
-    backend  = _BACKENDS.get(provider, _call_gemini)
+    if provider not in _BACKENDS:
+        raise ValueError(
+            f"Unknown LLM provider: {provider!r}. "
+            f"Choose from: {', '.join(sorted(_BACKENDS))}"
+        )
+    backend = _BACKENDS[provider]
 
     # Resolve entity/attribute for UNCERTAIN (Layer 1 flagged but no Conflict obj)
     if layer1_result.conflicts:

@@ -1,0 +1,10 @@
+File                                          Mode       Key                 N    Acc%   Lat_ms   Tokens
+----------------------------------------------------------------------------------------------------
+20260819T082144_l1_summary.json               l1         T1_PR              50    0.0%      0.8        0
+20260819T082304_l1l2_summary.json             l1l2       T1_PR              50    0.0%      0.9      374
+20260819T082334_baseline_summary.json         baseline   T1_PR              50    0.0%      0.3     3320
+
+L1+L2 hit-rate (20260819T082304_l1l2_results.csv):
+  Total rows: 50
+  L1 resolved: 5 (10.0%)
+  Fell to L2:  45 (90.0%)

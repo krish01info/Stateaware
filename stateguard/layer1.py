@@ -69,6 +69,7 @@ class InterceptResult:
 ATTRIBUTE_ALIASES: dict[str, str] = {
     # diet / food
     "diet":         "diet",
+    "dietary":      "diet",
     "eating":       "diet",
     "food":         "diet",
     "vegan":        "diet",
@@ -197,7 +198,11 @@ _STOPWORDS = {
     "Would", "Should", "What", "When", "Where", "Who", "Why", "How",
     "Is", "Are", "Was", "Were", "Do", "Does", "Did", "Make", "Please",
     "Tell", "Give", "Show", "Book", "Order", "Find", "Help", "Plan",
-    "New",  # e.g. "New York"
+    "New",   # e.g. "New York"
+    "Will", "Let", "Some", "But", "Just", "Also", "Want", "Need",
+    "Like", "Think", "Know", "Get", "Got", "Each", "Every",
+    "May", "Might", "Must", "Been", "Have", "Has", "Had",
+    "Not", "All", "Any", "Most", "More", "Very",
 }
 
 
@@ -219,9 +224,11 @@ def extract_attribute(query: str) -> Optional[str]:
     Checks multi-word phrases before single words to avoid partial matches.
     """
     q_lower = query.lower()
-    # Sort by length descending so "lives in" matches before "in"
+    # Sort by length descending so "lives in" matches before "in".
+    # Use word-boundary regex to avoid substring collisions
+    # (e.g. "age" inside "manage", "pet" inside "carpet").
     for alias in sorted(ATTRIBUTE_ALIASES, key=len, reverse=True):
-        if alias in q_lower:
+        if re.search(rf"\b{re.escape(alias)}\b", q_lower):
             return ATTRIBUTE_ALIASES[alias]
     return None
 

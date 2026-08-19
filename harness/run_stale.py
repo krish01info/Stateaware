@@ -242,25 +242,10 @@ def run_row(conn, row: dict, dim: str, mode: str,
 
     # ── Mode: L1 + L2 ────────────────────────────────────────────────────────
     if mode == "l1l2":
-        from stateguard.layer1 import InterceptResult, Conflict
         l1 = check(conn, query, known_entity=entity)
 
-        # For dim2 (PR): STALE guarantees every query has a stale premise.
-        # If L1 didn't detect it, pre-populate a Conflict so L2 gets full
-        # grounding context (entity, attribute, old vs current value).
-        if dim == "dim2_query" and l1.status in (Status.UNKNOWN, Status.PASS):
-            l1 = InterceptResult(
-                status=Status.UNCERTAIN,
-                raw_query=query,
-                conflicts=[
-                    Conflict(
-                        entity=entity,
-                        attribute=attribute,
-                        queried_value=old_value,
-                        current_value=new_value,
-                    )
-                ],
-            )
+        # Track whether L1 resolved this query (for reporting L1 hit-rate).
+        l1_resolved = l1.status in (Status.CONFLICT, Status.UNCERTAIN)
 
         if l1.status in (Status.CONFLICT, Status.UNCERTAIN):
             l2 = check_l2(conn, query, l1, provider=provider)
@@ -284,6 +269,7 @@ def run_row(conn, row: dict, dim: str, mode: str,
             "dim":             DIM_LABELS[dim],
             "mode":            mode,
             "status":          final_status.value,
+            "l1_resolved":     l1_resolved,
             "intercepted":     intercepted,
             "corrected_query": corrected,
             "correct":         correct,
