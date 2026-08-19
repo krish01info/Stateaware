@@ -46,3 +46,8 @@ stale_explore.json
 
 # Gemini/agent artifacts
 .gemini/
+
+# Temporary benchmark/debug scripts and output files
+_*.py
+*.txt
+!requirements.txt
