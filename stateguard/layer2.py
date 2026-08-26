@@ -166,7 +166,7 @@ def _call_groq(system: str, user: str) -> tuple[str, int]:
         base_url="https://api.groq.com/openai/v1",
     )
     resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
@@ -178,12 +178,31 @@ def _call_groq(system: str, user: str) -> tuple[str, int]:
     return resp.choices[0].message.content, tok
 
 
+_MOCK_WARNED = False
+
 def _call_mock(system: str, user: str) -> str:
     """
-    Deterministic stub for unit tests — no API key required.
-    Returns 'is_stale: true' if the word 'vegetarian' appears in the user
-    message and current fact contains 'vegan', otherwise 'is_stale: false'.
+    Deterministic stub for UNIT TESTS ONLY — no API key required.
+
+    ⚠️  This backend only recognizes one hardcoded scenario (vegetarian→vegan).
+    It will report is_stale=False for every other attribute/value pair,
+    regardless of whether the query is actually stale. Do NOT use --provider
+    mock to evaluate real accuracy on the STALE benchmark or any dataset
+    beyond diet-only smoke tests — results will look artificially poor (or
+    meaningless) on every other dimension since this stub can never say
+    'true' for them.
     """
+    global _MOCK_WARNED
+    if not _MOCK_WARNED:
+        import sys
+        print(
+            "[stateguard.layer2] WARNING: using 'mock' LLM backend — this "
+            "stub only detects the vegetarian/vegan scenario and will "
+            "under-report is_stale=true for everything else. Use "
+            "--provider groq/gemini/openai for real accuracy numbers.",
+            file=sys.stderr,
+        )
+        _MOCK_WARNED = True
     is_stale = "vegetarian" in user.lower() and "vegan" in user.lower()
     corrected = None
     if is_stale:
@@ -214,14 +233,33 @@ def _parse_response(raw: str) -> dict:
     """
     Parse the LLM JSON response.
     Falls back gracefully if the model returns extra whitespace or markdown.
+
+    On failure, returns a fail-safe default (is_stale=False) AND sets
+    "_parse_error": True so callers can distinguish "the model genuinely
+    said not-stale" from "we couldn't parse the model's output and are
+    guessing". Previously these were indistinguishable, which meant
+    malformed LLM output silently inflated the "not stale" / false-negative
+    count with no visibility.
     """
-    # Strip possible ```json ... ``` fences
     cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        parsed.setdefault("_parse_error", False)
+        return parsed
     except json.JSONDecodeError:
-        # Last-resort: return a safe default (treat as NOT stale)
-        return {"is_stale": False, "reason": "parse error", "corrected_query": None}
+        import sys
+        print(
+            f"[stateguard.layer2] WARNING: failed to parse LLM response as "
+            f"JSON, defaulting to is_stale=False. Raw response (truncated): "
+            f"{raw[:200]!r}",
+            file=sys.stderr,
+        )
+        return {
+            "is_stale": False,
+            "reason": "parse error",
+            "corrected_query": None,
+            "_parse_error": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -304,4 +342,5 @@ def check_l2(
         result.corrected_query = None
 
     result.tokens_used = tokens_used
+    result.parse_error = parsed.get("_parse_error", False)
     return result

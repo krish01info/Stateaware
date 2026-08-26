@@ -206,10 +206,20 @@ def _call_main_llm(query: str, haystack: list, provider: str = "mock") -> tuple[
 # ---------------------------------------------------------------------------
 
 def run_row(conn, row: dict, dim: str, mode: str,
-            provider: str = "mock") -> dict:
+            provider: str = "mock", use_ner: bool = False) -> dict:
     """
     Evaluate one (row, dim) pair.
     Returns a result dict with status, correct, latency_ms, tokens_used.
+
+    use_ner : if False (default, preserves prior behaviour), the entity is
+              handed to Layer 1 via known_entity=entity, bypassing
+              extract_entity_names() entirely. That means accuracy numbers
+              never reflect real-world entity resolution — the harness was
+              always testing Layer 1 with NER effectively disabled. Pass
+              use_ner=True to run Layer 1's actual regex-based entity
+              extraction on the raw query, the way it would run in
+              production when the caller doesn't already know who the
+              conversation is about.
     """
     query = row["probing_queries"][dim]
     haystack = row["haystack_session"]
@@ -217,17 +227,25 @@ def run_row(conn, row: dict, dim: str, mode: str,
     t0 = time.perf_counter()
 
     entity, attribute, old_value, new_value = seed_db(conn, row)
+    known_entity = None if use_ner else entity
+
+    # dim1 (SR) and dim3 (IPA) queries do NOT carry a stale premise the
+    # pipeline should intercept — "correct" for them means the pipeline
+    # left the query alone (no false-positive CONFLICT). dim2 (PR) queries
+    # DO carry a stale premise — "correct" means the pipeline caught it.
+    # Previously dim1/dim3 were scored as None and silently dropped from
+    # summarise(), so over-triggering (flagging everything as stale) was
+    # invisible in the reported accuracy. See PR notes.
+    def _score(intercepted: bool) -> bool:
+        return intercepted if dim == "dim2_query" else (not intercepted)
 
     # ── Mode: L1 only ────────────────────────────────────────────────────────
     if mode == "l1":
-        l1 = check(conn, query, known_entity=entity)
+        l1 = check(conn, query, known_entity=known_entity)
         latency_ms  = (time.perf_counter() - t0) * 1000
         tokens_used = 0
         intercepted = l1.status == Status.CONFLICT
-        if dim == "dim2_query":
-            correct = intercepted
-        else:
-            correct = None
+        correct = _score(intercepted)
         return {
             "uid":         row["uid"],
             "type":        row["type"],
@@ -242,7 +260,7 @@ def run_row(conn, row: dict, dim: str, mode: str,
 
     # ── Mode: L1 + L2 ────────────────────────────────────────────────────────
     if mode == "l1l2":
-        l1 = check(conn, query, known_entity=entity)
+        l1 = check(conn, query, known_entity=known_entity)
 
         # Track whether L1 resolved this query (for reporting L1 hit-rate).
         l1_resolved = l1.status in (Status.CONFLICT, Status.UNCERTAIN)
@@ -252,17 +270,16 @@ def run_row(conn, row: dict, dim: str, mode: str,
             final_status  = l2.status
             corrected     = l2.corrected_query
             tokens_used   = l2.tokens_used
+            parse_error   = l2.parse_error
         else:
             final_status  = l1.status
             corrected     = None
             tokens_used   = 0
+            parse_error   = False
 
         latency_ms  = (time.perf_counter() - t0) * 1000
         intercepted = final_status == Status.CONFLICT
-        if dim == "dim2_query":
-            correct = intercepted
-        else:
-            correct = None
+        correct = _score(intercepted)
         return {
             "uid":             row["uid"],
             "type":            row["type"],
@@ -273,6 +290,7 @@ def run_row(conn, row: dict, dim: str, mode: str,
             "intercepted":     intercepted,
             "corrected_query": corrected,
             "correct":         correct,
+            "parse_error":     parse_error,
             "latency_ms":      round(latency_ms, 2),
             "tokens_used":     tokens_used,
         }
@@ -342,9 +360,16 @@ def main():
         help="LLM backend for l1l2 and baseline modes"
     )
     parser.add_argument(
-        "--dims", nargs="+", default=["dim2_query"],
+        "--dims", nargs="+", default=list(DIMS),
         choices=list(DIMS),
-        help="Which query dimensions to evaluate (default: dim2_query = PR)"
+        help="Which query dimensions to evaluate (default: all three — "
+             "dim2_query alone hides false-positive rate on dim1/dim3)"
+    )
+    parser.add_argument(
+        "--use-ner", action="store_true",
+        help="Run Layer 1's real entity extraction (extract_entity_names) "
+             "instead of cheating with known_entity=<ground-truth entity>. "
+             "Without this flag, entity-resolution accuracy is never tested."
     )
     parser.add_argument(
         "--limit", type=int, default=None,
@@ -357,7 +382,7 @@ def main():
     args = parser.parse_args()
 
     print(f"[StateGuard Harness] mode={args.mode}  provider={args.provider}  "
-          f"dims={args.dims}  limit={args.limit}")
+          f"dims={args.dims}  limit={args.limit}  use_ner={args.use_ner}")
 
     # Load dataset
     print("Loading STALEproj/STALE …")
@@ -377,7 +402,7 @@ def main():
         conn = init_db(":memory:")   # fresh DB per row
         for dim in args.dims:
             try:
-                r = run_row(conn, row, dim, args.mode, args.provider)
+                r = run_row(conn, row, dim, args.mode, args.provider, use_ner=args.use_ner)
             except Exception as exc:
                 r = {
                     "uid":        row["uid"],

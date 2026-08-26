@@ -3,6 +3,9 @@ Tests for StateGuard Layer 2 (mock backend — no API key needed).
 
 Run:  pytest test_layer2.py -v
 """
+import sys
+import types
+
 import pytest
 
 from stateguard.db import init_db, upsert_fact
@@ -65,3 +68,27 @@ def test_unknown_provider_raises(conn):
     l1.status = Status.UNCERTAIN
     with pytest.raises(ValueError, match="Unknown LLM provider"):
         check_l2(conn, query, l1, provider="typo_provider")
+
+
+def test_groq_backend_uses_supported_model(monkeypatch):
+    """Groq requests use the replacement model for the retired Llama 3.3 ID."""
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(
+                usage=types.SimpleNamespace(total_tokens=7),
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="{}"))],
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+    from stateguard.layer2 import _call_groq
+
+    _call_groq("system", "user")
+    assert captured["model"] == "openai/gpt-oss-120b"

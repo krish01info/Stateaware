@@ -51,6 +51,11 @@ class InterceptResult:
     # Filled in by Layer 2 when status == UNCERTAIN or CONFLICT
     corrected_query: Optional[str] = None
     tokens_used: int = 0
+    # True if Layer 2's LLM response failed to parse as JSON and the result
+    # below is a fail-safe default (is_stale=False), NOT a genuine model
+    # verdict. Kept separate so callers/harnesses don't silently conflate
+    # "confirmed not stale" with "we couldn't tell". See layer2._parse_response.
+    parse_error: bool = False
 
     def __repr__(self):
         return (
@@ -235,8 +240,16 @@ def extract_attribute(query: str) -> Optional[str]:
 
 def extract_queried_value(query: str, attribute: str) -> Optional[str]:
     """
-    Best-effort extraction of the value the query *assumes* for *attribute*.
-    Returns the value string or None (→ Layer 2 handles it).
+    Best-effort extraction of the value the query *assumes* for *attribute*,
+    using the small closed vocabularies below as a fast, dependency-free path.
+
+    NOTE: this only covers ~4 attributes (diet/location/job/relationship) with
+    a hand-picked set of values. It intentionally returns None for anything
+    outside those lists (e.g. any hobby/pet/education/health value, or a city
+    not in LOCATION_VALUES) so that `check()` can fall back to
+    `match_against_known_values()`, which checks the entity's *actual* stored
+    values instead of a fixed vocabulary. Prefer extending that fallback over
+    growing these lists further — hardcoded value sets don't generalize.
     """
     q_lower = query.lower()
     if attribute == "diet":
@@ -255,6 +268,34 @@ def extract_queried_value(query: str, attribute: str) -> Optional[str]:
         for v in RELATIONSHIP_VALUES:
             if v in q_lower:
                 return v
+    return None
+
+
+def match_against_known_values(
+    query: str,
+    current_value: Optional[str],
+    old_value: Optional[str],
+) -> Optional[str]:
+    """
+    Dynamic fallback for extract_queried_value(): instead of checking the
+    query against a global hardcoded vocabulary, check it against the
+    *specific* values already on record for this entity/attribute (the
+    current DB value and, if it exists, the superseded old value).
+
+    This generalizes to arbitrary attributes/values — custom cities, job
+    titles, hobbies, pets, whatever's actually in the DB — without needing
+    to hand-enumerate every possible value up front.
+
+    Returns the matched value string (from current_value or old_value),
+    or None if neither appears in the query.
+    """
+    q_lower = query.lower()
+    candidates = [v for v in (current_value, old_value) if v]
+    # Check the longer value first to avoid a short value matching inside
+    # a longer one that also appears (e.g. "engineer" inside "senior engineer").
+    for val in sorted(candidates, key=len, reverse=True):
+        if val.lower() in q_lower:
+            return val
     return None
 
 
@@ -308,21 +349,32 @@ def check(
         if db_fact is None:
             continue
 
-        queried_value = extract_queried_value(query, attribute)
+        current_value = db_fact["value"]
+        supersession = get_supersession_context(conn, entity, attribute)
+        old_value = supersession.get("old_value") if supersession else None
+
+        # 1. Try matching the query against the entity's own current/old
+        #    values first — this is more precise than the generic vocab
+        #    below, and avoids a bug where a generic word like "engineer"
+        #    matches inside a longer current value ("staff platform
+        #    reliability engineer") and gets wrongly compared as unequal.
+        queried_value = match_against_known_values(query, current_value, old_value)
+
+        # 2. Fallback: fixed vocabulary (diet/location/job/relationship only)
+        if queried_value is None:
+            queried_value = extract_queried_value(query, attribute)
 
         if queried_value is None:
-            # Attribute mentioned but can't parse assumed value
-            # Try word-overlap: does the query share words with the OLD value?
-            supersession = get_supersession_context(conn, entity, attribute)
+            # Still nothing concrete — last resort: loose word-overlap
+            # against the OLD value only (weak signal, routes to Layer 2).
             if supersession:
-                old_val = supersession.get("old_value", "")
-                if _has_word_overlap(query, old_val, db_fact["value"]):
+                if _has_word_overlap(query, old_value or "", current_value):
                     uncertain = True
                     continue
             uncertain = True
             continue
 
-        if queried_value.lower() == db_fact["value"].lower():
+        if queried_value.lower() == current_value.lower():
             result.status = Status.PASS
         else:
             conflicts.append(
@@ -330,7 +382,7 @@ def check(
                     entity=entity,
                     attribute=attribute,
                     queried_value=queried_value,
-                    current_value=db_fact["value"],
+                    current_value=current_value,
                 )
             )
 
@@ -349,9 +401,25 @@ def check(
 # Word-overlap detection helpers
 # ---------------------------------------------------------------------------
 
+_SUFFIXES = ("ism", "ing", "ers", "er", "ed", "es", "s")
+
+def _stem(word: str) -> str:
+    """
+    Very light suffix stripping so near-forms overlap, e.g.
+    'vegetarianism' ~ 'vegetarian', 'engineering' ~ 'engineer'.
+    Not a real stemmer (no Porter rules) — just enough to catch the
+    common cases without extra dependencies. Only strips if the
+    remaining stem is still >= 3 chars, to avoid over-stripping short words.
+    """
+    for suf in _SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= 3:
+            return word[: -len(suf)]
+    return word
+
+
 def _tokenize(text: str) -> set[str]:
-    """Simple word tokenizer: lowercase, alpha-only, 3+ chars."""
-    return {w for w in re.findall(r'[a-z]{3,}', text.lower())}
+    """Simple word tokenizer: lowercase, alpha-only, 3+ chars, light-stemmed."""
+    return {_stem(w) for w in re.findall(r'[a-z]{3,}', text.lower())}
 
 _COMMON_WORDS = {
     "the", "and", "that", "this", "with", "from", "for", "are", "was",
