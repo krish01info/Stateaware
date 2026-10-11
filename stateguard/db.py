@@ -73,8 +73,31 @@ def init_db(path: str = "stateguard.db") -> sqlite3.Connection:
     conn = sqlite3.connect(path, detect_types=sqlite3.PARSE_DECLTYPES)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
-    conn.commit()
+    migrate(conn)
     return conn
+
+
+# Columns added for the general-purpose library (stateguard.store). Older
+# databases are upgraded in place; legacy functions ignore the new columns.
+_FACT_COLUMNS = {
+    "source": "TEXT",
+    "confidence": "REAL NOT NULL DEFAULT 1.0",
+    "scope": "TEXT",
+}
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Idempotently bring an existing database up to the current schema."""
+    conn.executescript(_SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(facts)")}
+    for col, decl in _FACT_COLUMNS.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE facts ADD COLUMN {col} {decl}")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS aliases ("
+        " alias TEXT PRIMARY KEY, entity_name TEXT NOT NULL)"
+    )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stateguard"
-version = "0.1.0"
-description = "Two-layer stale-premise interceptor for LLM memory systems"
+version = "0.2.0"
+description = "Pre-hoc interception of stale-state premises for LLM agents (PASS / REVIEW / BLOCK)"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -16,6 +16,7 @@ gemini = ["google-generativeai>=0.5"]
 openai = ["openai>=1.0"]
 groq   = ["openai>=1.0"]
 eval   = ["datasets>=2.0"]
+all    = ["openai>=1.0", "google-generativeai>=0.5", "datasets>=2.0"]
 dev    = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
