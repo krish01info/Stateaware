@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
-  <img src="https://img.shields.io/badge/version-0.4.0-informational" alt="v0.2.0">
+  <img src="https://img.shields.io/badge/version-0.5.0-informational" alt="v0.2.0">
 </p>
 
 ---
@@ -160,7 +160,42 @@ later request can actually contain. Questions, hypotheticals, other people's
 facts and ended states are ignored, and extractions below `min_confidence`
 are returned in `skipped` instead of being written.
 
-**6. Entity resolution is separate and visible.** Hosts should pass
+**6. Checking agent actions.** Stale memory does the most damage when an
+agent *acts* on it. `check_tool_call` checks a tool call's arguments before
+it runs and returns corrected arguments on BLOCK:
+
+```python
+r = guard.check_tool_call("book_flight", {"origin": "Bengaluru", "date": "2026-11-02"},
+                          ["me"], arg_map={"origin": "location"})
+r.decision             # BLOCK
+r.suggested_arguments  # {"origin": "Pune", "date": "2026-11-02"}
+```
+
+Arguments are linked to attributes through `arg_map`, through the argument
+name ("city", "address", "plan_tier"), or by value alone with lower scores.
+Nested dicts, lists and free-text arguments are all checked, and every use
+of a confirmed stale value in the call is corrected.
+
+**7. A chat wrapper that asks instead of guessing.** `GuardedChat` wraps
+any chat model (a callable taking OpenAI-style messages):
+
+* **BLOCK**: the user's text is sent **unchanged**, with a short system
+  *memory note* ("your diet is now 'vegan' (since 2026-07-02) ... answer for
+  the current state and say what you assumed"). Nothing is rewritten
+  behind the user's back.
+* **REVIEW**: the wrapper asks one clarifying question ("Quick check: you
+  mentioned vegetarian, but I have your diet as vegan since 2026-07-02.
+  Should I go with vegan?") and never asks twice in a row. The answer is
+  learned through `observe()`, and the original request is re-checked and
+  answered.
+
+See [`examples/agent_and_chat.py`](examples/agent_and_chat.py).
+
+**8. Hinglish.** Framing cues include common Hinglish ("pehle", "ab
+nahi", "ki jagah", "agle hafte", "abhi bhi"), and negation placed after the
+word ("vegetarian **nahi** hai") is handled.
+
+**9. Entity resolution is separate and visible.** Hosts should pass
 `entity_ids`. Without them, `HeuristicEntityResolver` matches entity IDs and
 aliases in the text, maps "my/I" to a configured `self_entity`, and otherwise
 reports `UNRESOLVED_ENTITY`. An unresolved request is `REVIEW` only if it
@@ -275,6 +310,8 @@ stateguard/
   verifier.py    Layer-2 structured verifier (version-chain grounding, strict JSON)
   implications.py write-time implication providers (LLM, static, cached)
   extraction.py  learning facts from user messages (StateGuard.observe)
+  tools.py       checking agent tool calls before they run
+  chat.py        GuardedChat wrapper, clarifying questions, memory notes
   guard.py       StateGuard decision engine
   db.py, layer1.py, layer2.py   v0.1 API, kept for the original ablations
 harness/
@@ -282,7 +319,7 @@ harness/
   run_general.py general fixtures runner
   run_stale.py   STALE runner (modes: l1, l1l2, guard, baseline)
   fixtures/general_state_cases.jsonl
-examples/basic_check.py
+examples/basic_check.py, examples/agent_and_chat.py
 ```
 
 ## Tests
@@ -304,8 +341,8 @@ pytest -q
 - **Word collisions.** A stored value that is an ordinary phrase ("30 days")
   can match unrelated text. Attribute cues and the generic-word rule reduce
   this but do not remove it.
-- **Framing cues are English-only.** They are small hand-written lists;
-  they are listed in `extractors.py` so they can be audited and replaced.
+- **Framing cues cover English and some Hinglish only.** They are small
+  hand-written lists in `extractors.py`, so they can be audited and extended.
 
 ## Citation
 

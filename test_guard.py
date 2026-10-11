@@ -267,3 +267,23 @@ def test_generic_uncued_word_is_review_not_block():
     assert g.check("Show me my monthly usage report", ["acct"]).decision is Decision.REVIEW
     # with an attribute cue it is a clear stale premise
     assert g.check("When is my next monthly bill due?", ["acct"]).decision is Decision.BLOCK
+
+
+# ---------------------------------------------------------------------------
+# Hinglish framing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("q,expected", [
+    ("Maya ke liye vegetarian khana order karo", Decision.BLOCK),           # assumes old
+    ("Maya pehle vegetarian thi, ab vegan hai, kya banau?", Decision.PASS),  # history + current
+    ("Maya ab vegetarian nahi hai, dinner ideas?", Decision.PASS),           # negated
+    ("Kya Maya abhi bhi vegetarian hai?", Decision.REVIEW),                 # asks
+    ("Maya agle hafte Seattle ghoomne jaayegi, hotels?", Decision.REVIEW),  # future
+])
+def test_hinglish(q, expected):
+    g = StateGuard()
+    g.remember("maya", "diet", "vegetarian", valid_from="2026-01-01")
+    g.remember("maya", "diet", "vegan", valid_from="2026-07-02")
+    g.remember("maya", "location", "Seattle", valid_from="2025-01-01")
+    g.remember("maya", "location", "Austin", valid_from="2026-06-01")
+    assert g.check(q, ["maya"]).decision is expected
