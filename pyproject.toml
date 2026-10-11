@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stateguard"
-version = "0.3.0"
+version = "0.4.0"
 description = "Pre-hoc interception of stale-state premises for LLM agents (PASS / REVIEW / BLOCK)"
 readme = "README.md"
 license = {text = "MIT"}

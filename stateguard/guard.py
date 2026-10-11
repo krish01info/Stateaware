@@ -35,6 +35,7 @@ A verifier that errors or returns low confidence yields REVIEW, never PASS.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
 from typing import Optional, Union
 
 from .extractors import (ACCOUNT_STATE, PERSON_PROFILE, AttributeExtractor,
@@ -47,6 +48,7 @@ from .resolvers import EntityResolver, HeuristicEntityResolver, ResolvedEntity
 from .store import FactStore, InMemoryFactStore
 from .verifier import Verifier
 from .implications import ImplicationProvider
+from .extraction import ExtractedFact, FactExtractor
 from .store import ImplicationStore
 
 # Score caps applied by premise framing. Kept as named constants so the paper
@@ -63,6 +65,14 @@ IMPLICIT_SCORE = 0.4      # attribute touched, no value named
 IMPLIED_SCORE = 0.7       # names a write-time implication of the change ("paneer" for vegan)
 IMPLIED_CUED_SCORE = 0.8  # ... and also touches the attribute ("paneer RECIPE")
 IMPLICIT_SCORE_DIRECT_Q = 0.1
+
+
+@dataclass
+class ObserveResult:
+    written: list[FactVersion] = field(default_factory=list)
+    skipped: list[ExtractedFact] = field(default_factory=list)
+    tokens_used: int = 0
+    error: Optional[str] = None
 
 
 class StateGuard:
@@ -85,6 +95,8 @@ class StateGuard:
                          deterministic layer cannot judge implicit premises,
                          and flagging every one would make REVIEW meaningless.
     max_verifications  : cap on Layer-2 calls per query (cost control).
+    fact_extractor     : optional :class:`FactExtractor` used by :meth:`observe`
+                         to learn facts from user messages.
     implications       : optional :class:`ImplicationProvider`. When set,
                          :meth:`remember` asks it once per new value which
                          phrases the change rules out, and :meth:`check`
@@ -105,6 +117,7 @@ class StateGuard:
         implicit_without_verifier: Decision = Decision.PASS,
         max_verifications: int = 2,
         implications: Optional[ImplicationProvider] = None,
+        fact_extractor: Optional[FactExtractor] = None,
     ) -> None:
         self.store = store if store is not None else InMemoryFactStore()
         self.resolver = resolver or HeuristicEntityResolver()
@@ -117,6 +130,7 @@ class StateGuard:
         self.implicit_without_verifier = implicit_without_verifier
         self.max_verifications = max_verifications
         self.implications = implications
+        self.fact_extractor = fact_extractor
         # Write-time cost accounting, so papers/dashboards can report it.
         self.write_tokens = 0
         self.write_calls = 0
@@ -136,6 +150,33 @@ class StateGuard:
         if self.implications is not None and not self._get_impl(entity_id, attribute, fv.scope):
             self.refresh_implications(entity_id, attribute, scope=fv.scope, reason=kw.get("reason"))
         return fv
+
+    def observe(self, entity_id: str, message: str, *, valid_from: Optional[str] = None,
+                min_confidence: float = 0.6, subject: Optional[str] = None) -> ObserveResult:
+        """Learn facts from a message the entity (usually the user) wrote.
+
+        Facts at or above ``min_confidence`` are recorded with
+        :meth:`remember` (so a changed value supersedes the old one and
+        write-time implications are generated); the rest are returned in
+        ``skipped`` for the host to log or confirm with the user.
+        """
+        if self.fact_extractor is None:
+            raise ValueError("no fact_extractor configured")
+        known = [f.attribute for f in self.store.current(entity_id)]
+        res = self.fact_extractor.extract(message, known, subject or "the user")
+        self.write_tokens += res.tokens_used
+        out = ObserveResult(tokens_used=res.tokens_used, error=res.error)
+        if res.error:
+            self.write_errors.append(f"observe {entity_id}: {res.error}")
+            return out
+        for f in res.facts:
+            if f.confidence < min_confidence:
+                out.skipped.append(f)
+                continue
+            out.written.append(self.remember(
+                entity_id, f.attribute, f.value, valid_from=valid_from, source="message",
+                confidence=f.confidence, reason=f.evidence or message[:120]))
+        return out
 
     def refresh_implications(self, entity_id: str, attribute: str,
                              scope: Optional[str] = None, reason: Optional[str] = None) -> int:

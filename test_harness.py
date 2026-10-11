@@ -127,3 +127,27 @@ def test_stale_runner_with_implications():
     conn = init_db(":memory:")
     r = run_row(conn, row, "dim3_query", "guard", implications=impl, ipa_label="stale")
     assert r["decision"] != "pass" and r["expected"] == "stale" and r["correct"]
+
+
+def test_stale_runner_seeds_from_messages():
+    """Real-life path: facts are learned from M_old/M_new, not parsed with regexes."""
+    import json as _json
+    from stateguard.extraction import LLMFactExtractor
+
+    def fn(system, user):
+        v = "vegan" if "vegan" in user.split("MESSAGE:")[1] else "vegetarian"
+        return _json.dumps({"facts": [{"attribute": "diet", "value": v,
+                                       "confidence": 0.9}]}), 50
+
+    ex = LLMFactExtractor(complete_fn=fn)
+    conn = init_db(":memory:")
+    r = run_row(conn, FAKE_ROW, "dim2_query", "guard", extractor=ex, use_ner=True)
+    assert r["seed"] == "messages" and r["seed_ok"]
+    assert r["decision"] == "block" and r["write_tokens"] == 100
+
+
+def test_manifest_records_constants():
+    from harness.metrics import manifest
+    m = manifest({"mode": "guard"})
+    assert m["constants"]["CAP_NEGATED"] == 0.15
+    assert m["defaults"]["block_threshold"] == 0.75 and m["args"] == {"mode": "guard"}

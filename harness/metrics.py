@@ -19,7 +19,10 @@ and optionally: group keys (e.g. "domain", "category", "dim"), "latency_ms",
 from __future__ import annotations
 
 import statistics
+import subprocess
 from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable
 
 DECISIONS = ("pass", "review", "block")
@@ -106,3 +109,34 @@ def format_table(cards: dict[str, dict], title: str = "") -> str:
             f"{f(c['lenient']['false_positive_rate'])} {f(c['review_rate']):>6} "
             f"{('  -' if lat is None else f'{lat:6.2f}')}")
     return "\n".join(lines)
+
+
+def manifest(args: dict) -> dict:
+    """Everything needed to show a result was produced by fixed, untuned code:
+    commit, uncommitted changes, library version, every decision constant,
+    and the exact run arguments."""
+    import stateguard
+    from stateguard import guard as g
+
+    repo = Path(__file__).resolve().parent.parent
+
+    def git(*a):
+        try:
+            return subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True,
+                                  timeout=10).stdout.strip()
+        except Exception:
+            return None
+
+    defaults = g.StateGuard()
+    return {
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "git_commit": git("rev-parse", "HEAD"),
+        "git_dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
+        "stateguard_version": stateguard.__version__,
+        "constants": {k: v for k, v in vars(g).items() if k.isupper()
+                      and isinstance(v, (int, float))},
+        "defaults": {"block_threshold": defaults.block_threshold,
+                     "review_threshold": defaults.review_threshold,
+                     "verifier_threshold": defaults.verifier_threshold},
+        "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in args.items()},
+    }

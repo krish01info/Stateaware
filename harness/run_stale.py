@@ -39,7 +39,7 @@ from stateguard.layer1 import check, Status
 from stateguard.layer2 import check_l2
 from stateguard import (CheckRequest, Decision, EvidenceKind, HeuristicEntityResolver,
                         LLMVerifier, SQLiteFactStore, StateGuard)
-from harness.metrics import by_group, format_table, scorecard
+from harness.metrics import by_group, format_table, manifest, scorecard
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -216,15 +216,44 @@ _LEGACY_DECISION = {
 }
 
 
-def _make_guard(conn, provider: str, use_ner: bool) -> StateGuard:
+def _make_guard(conn, provider: str, use_ner: bool, self_entity: str = None) -> StateGuard:
     verifier = None
     if provider and provider != "mock":
         verifier = LLMVerifier(provider)
+    # STALE queries are written by the user about themselves ("my diet"). A
+    # deployed assistant knows who its user is, so "I/my" resolves to them.
     return StateGuard(
         SQLiteFactStore(conn),
-        resolver=HeuristicEntityResolver(single_entity_default=use_ner),
+        resolver=HeuristicEntityResolver(self_entity=self_entity,
+                                         single_entity_default=use_ner),
         verifier=verifier,
     )
+
+
+# Two fixed, ordered timestamps: M_old is earlier than M_new by construction.
+_T_OLD, _T_NEW = "2026-01-01T00:00:00+00:00", "2026-06-01T00:00:00+00:00"
+
+
+def seed_from_messages(conn, row: dict, extractor) -> tuple:
+    """Real-life seeding: learn facts from the raw memory messages with
+    StateGuard.observe(), exactly as a deployed agent would. No regexes,
+    no use of STALE's 'explanation' field.
+
+    Returns (entity, attribute, old_value, new_value, write_tokens, ok)
+    where ok=False means extraction found no changed attribute.
+    """
+    entity = f"user_{row['uid'][:8]}"
+    g = StateGuard(SQLiteFactStore(conn), fact_extractor=extractor)
+    g.observe(entity, row["M_old"], valid_from=_T_OLD)
+    g.observe(entity, row["M_new"], valid_from=_T_NEW)
+    for fact in g.store.current(entity):
+        hist = g.store.history(entity, fact.attribute)
+        older = [h.value for h in hist if not h.is_current and h.value != fact.value]
+        if older:
+            return entity, fact.attribute, older[0], fact.value, g.write_tokens, True
+    cur = g.store.current(entity)
+    attr = cur[0].attribute if cur else None
+    return entity, attr, None, (cur[0].value if cur else None), g.write_tokens, False
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +262,7 @@ def _make_guard(conn, provider: str, use_ner: bool) -> StateGuard:
 
 def run_row(conn, row: dict, dim: str, mode: str,
             provider: str = "mock", use_ner: bool = False, implications=None,
-            ipa_label: str = "neutral") -> dict:
+            ipa_label: str = "neutral", extractor=None) -> dict:
     """
     Evaluate one (row, dim) pair.
     Returns a result dict with status, correct, latency_ms, tokens_used.
@@ -252,7 +281,14 @@ def run_row(conn, row: dict, dim: str, mode: str,
     haystack = row["haystack_session"]
 
     # Seeding the store is setup, not interception: keep it out of latency.
-    entity, attribute, old_value, new_value = seed_db(conn, row)
+    seed_tokens, seed_ok = 0, True
+    if extractor is not None:
+        entity, attribute, old_value, new_value, seed_tokens, seed_ok = \
+            seed_from_messages(conn, row, extractor)
+        if new_value is None:          # judge for baseline mode still needs a target
+            new_value = _parse_explanation(row["explanation"])[1]
+    else:
+        entity, attribute, old_value, new_value = seed_db(conn, row)
     known_entity = None if use_ner else entity
     # PR (dim2) always carries a stale premise. IPA (dim3) queries never name
     # the old state but only have a correct answer under the new one; whether
@@ -334,8 +370,8 @@ def run_row(conn, row: dict, dim: str, mode: str,
 
     # ── Mode: v0.2 StateGuard engine (PASS / REVIEW / BLOCK) ────────────────
     if mode == "guard":
-        guard = _make_guard(conn, provider, use_ner)
-        if implications is not None:
+        guard = _make_guard(conn, provider, use_ner, self_entity=entity)
+        if implications is not None and attribute:
             # Write-time step: paid once per fact change, excluded from query latency.
             guard.implications = implications
             guard.refresh_implications(entity, attribute)
@@ -360,8 +396,10 @@ def run_row(conn, row: dict, dim: str, mode: str,
                                        for e in resp.evidence),
             "latency_ms":      round(latency_ms, 2),
             "tokens_used":     resp.tokens_used,
-            "write_tokens":    guard.write_tokens,
+            "write_tokens":    guard.write_tokens + seed_tokens,
             "write_calls":     guard.write_calls,
+            "seed":            "messages" if extractor is not None else "regex",
+            "seed_ok":         seed_ok,
         }
 
     # ── Mode: baseline (no interceptor, raw LLM) ────────────────────────────
@@ -442,6 +480,12 @@ def main():
              "Without this flag, entity-resolution accuracy is never tested."
     )
     parser.add_argument(
+        "--seed", choices=["regex", "messages"], default="regex",
+        help="how facts enter the store: 'regex' (v0.1 parser of M_old/explanation) "
+             "or 'messages' (StateGuard.observe() over M_old then M_new, like a real "
+             "agent; needs --seed-provider)")
+    parser.add_argument("--seed-provider", default="groq")
+    parser.add_argument(
         "--ipa-label", choices=["neutral", "stale"], default="neutral",
         help="score IPA (dim3) queries as should-pass (default) or should-intercept")
     parser.add_argument(
@@ -478,6 +522,12 @@ def main():
         impl = CachedImplicationProvider(LLMImplicationProvider(args.implications),
                                          Path(__file__).parent / "cache" / "implications.json")
 
+    extractor = None
+    if args.seed == "messages":
+        from stateguard.extraction import LLMFactExtractor
+        extractor = LLMFactExtractor(args.seed_provider, cache_path=Path(__file__).parent
+                                     / "cache" / "extractions.json")
+
     results = []
     total   = len(rows) * len(args.dims)
     done    = 0
@@ -487,7 +537,8 @@ def main():
         for dim in args.dims:
             try:
                 r = run_row(conn, row, dim, args.mode, args.provider, use_ner=args.use_ner,
-                            implications=impl, ipa_label=args.ipa_label)
+                            implications=impl, ipa_label=args.ipa_label,
+                            extractor=extractor)
             except Exception as exc:
                 r = {
                     "uid":        row["uid"],
@@ -524,7 +575,8 @@ def main():
     # JSON – summary
     summary = summarise(results)
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"mode": args.mode, "provider": args.provider,
+        json.dump({"manifest": manifest(vars(args)),
+                   "mode": args.mode, "provider": args.provider,
                    "n_rows": len(rows), "dims": args.dims,
                    "summary": summary}, f, indent=2)
     print(f"[OK] Summary saved -> {json_path}")
