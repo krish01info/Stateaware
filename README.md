@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
-  <img src="https://img.shields.io/badge/version-0.3.0-informational" alt="v0.2.0">
+  <img src="https://img.shields.io/badge/version-0.4.0-informational" alt="v0.2.0">
 </p>
 
 ---
@@ -139,7 +139,28 @@ across all users and every experiment can be re-run offline. Failed
 generations are recorded in `guard.write_errors` and simply leave the fact
 without implications.
 
-**5. Entity resolution is separate and visible.** Hosts should pass
+**5. Learning facts from what users say.** Real agents get messages, not
+clean `(attribute, value)` pairs. `guard.observe(user, message)` asks a
+cheap model to extract current, first-hand facts and records them, so a
+changed value supersedes the old one automatically.
+
+```python
+from stateguard import StateGuard, LLMFactExtractor
+
+guard = StateGuard(fact_extractor=LLMFactExtractor("groq", cache_path="extractions.json"))
+guard.observe("me", "I'm vegetarian, I love paneer")
+guard.observe("me", "Update: went fully vegan last month")   # diet: vegetarian -> vegan
+guard.check("Book me a vegetarian dinner", ["me"])           # BLOCK
+```
+
+The extractor is shown the attributes already on record and must reuse
+them, so "diet" never splits into "diet" and "dietary_preference" (which
+would hide every change). Values are kept to short canonical forms that a
+later request can actually contain. Questions, hypotheticals, other people's
+facts and ended states are ignored, and extractions below `min_confidence`
+are returned in `skipped` instead of being written.
+
+**6. Entity resolution is separate and visible.** Hosts should pass
 `entity_ids`. Without them, `HeuristicEntityResolver` matches entity IDs and
 aliases in the text, maps "my/I" to a configured `self_entity`, and otherwise
 reports `UNRESOLVED_ENTITY`. An unresolved request is `REVIEW` only if it
@@ -211,6 +232,7 @@ python harness/run_stale.py --mode guard                    # v0.2 engine, Layer
 python harness/run_stale.py --mode guard --provider groq    # v0.2 engine + verifier
 python harness/run_stale.py --mode guard --use-ner          # entity resolved from text
 python harness/run_stale.py --mode guard --implications groq --ipa-label stale
+python harness/run_stale.py --mode guard --seed messages --use-ner   # the real-life path
 python harness/run_stale.py --mode baseline --provider gemini
 ```
 
@@ -221,6 +243,25 @@ answer under the new one, so whether an interceptor should flag them is a
 framing choice: `--ipa-label neutral` (default) or `stale`. Report both.
 Seeding the store and generating implications are excluded from query
 latency and reported as write-time cost.
+
+`--seed messages` is the setting closest to deployment. Facts are learned
+from STALE's raw memory messages with `observe()`, exactly as an agent would
+learn them; STALE's answer-bearing `explanation` field is never read. With
+`--use-ner`, the user's own "I/my" resolves to them, as it would for any
+assistant that knows who it is talking to.
+
+### Evaluation protocol: STALE is a test, not a training signal
+
+To keep results honest and transferable to real use:
+
+1. Every rule, cue list and threshold is fixed **before** STALE is run, and
+   is developed only on the general fixtures and real usage.
+2. STALE is run once per configuration. If a STALE result prompts a change,
+   the change has to be justified by a non-STALE failure and the run is
+   reported as a new version, not a replacement.
+3. Every summary JSON includes a `manifest`: git commit, whether the tree
+   was dirty, library version, every decision constant and the run
+   arguments. Report the commit hash with each number in the paper.
 
 ## Project layout
 
@@ -233,6 +274,7 @@ stateguard/
   extractors.py  attribute cue packs + premise framing
   verifier.py    Layer-2 structured verifier (version-chain grounding, strict JSON)
   implications.py write-time implication providers (LLM, static, cached)
+  extraction.py  learning facts from user messages (StateGuard.observe)
   guard.py       StateGuard decision engine
   db.py, layer1.py, layer2.py   v0.1 API, kept for the original ablations
 harness/

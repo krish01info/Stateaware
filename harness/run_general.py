@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from stateguard import (CheckRequest, Decision, EvidenceKind, HeuristicEntityResolver,
                         InMemoryFactStore, LLMVerifier, StateGuard)
-from harness.metrics import by_group, format_table, scorecard
+from harness.metrics import by_group, format_table, manifest, scorecard
 from stateguard.implications import CachedImplicationProvider, LLMImplicationProvider
 
 HERE = Path(__file__).parent
@@ -128,7 +128,7 @@ def main(argv=None):
         print(f"\nWrite-time implications: {impl.misses} generated, {impl.hits} from cache, "
               f"{overall.get('write', {}).get('tokens', 0)} tokens this run, {errs} errors")
     (args.out / f"{tag}_{mode}.json").write_text(json.dumps(
-        {"mode": mode, "overall": overall, "by_domain": by_group(rows, "domain"),
+        {"manifest": manifest(vars(args)), "mode": mode, "overall": overall, "by_domain": by_group(rows, "domain"),
          "by_category": by_group(rows, "category"), "rows": rows}, indent=2))
     return overall
 
