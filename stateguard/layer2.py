@@ -180,7 +180,7 @@ def _call_groq(system: str, user: str) -> tuple[str, int]:
 
 _MOCK_WARNED = False
 
-def _call_mock(system: str, user: str) -> str:
+def _call_mock(system: str, user: str) -> tuple[str, int]:
     """
     Deterministic stub for UNIT TESTS ONLY — no API key required.
 
@@ -334,7 +334,12 @@ def check_l2(
         raw_query=query,
     )
 
-    if parsed.get("is_stale"):
+    if parsed.get("_parse_error"):
+        # Unparseable output is "we could not tell", not "verified not stale":
+        # keep the query flagged as UNCERTAIN instead of silently passing it.
+        result.status          = Status.UNCERTAIN
+        result.corrected_query = None
+    elif parsed.get("is_stale"):
         result.status          = Status.CONFLICT
         result.corrected_query = parsed.get("corrected_query")
     else:

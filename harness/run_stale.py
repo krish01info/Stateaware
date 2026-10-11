@@ -13,6 +13,10 @@ python harness/run_stale.py --mode l1l2 --provider gemini
 # Baseline – plain LLM sees the raw query with the haystack (no interceptor)
 python harness/run_stale.py --mode baseline --provider gemini
 
+# v0.2 engine (PASS/REVIEW/BLOCK), Layer 1 only, then with the verifier
+python harness/run_stale.py --mode guard
+python harness/run_stale.py --mode guard --provider groq
+
 Results are written to:
   harness/results/<timestamp>_<mode>_results.csv
   harness/results/<timestamp>_<mode>_summary.json
@@ -30,11 +34,12 @@ from pathlib import Path
 # Allow running from the project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from datasets import load_dataset
-
 from stateguard.db    import init_db, upsert_fact
 from stateguard.layer1 import check, Status
 from stateguard.layer2 import check_l2
+from stateguard import (CheckRequest, Decision, EvidenceKind, HeuristicEntityResolver,
+                        LLMVerifier, SQLiteFactStore, StateGuard)
+from harness.metrics import by_group, format_table, scorecard
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -202,6 +207,27 @@ def _call_main_llm(query: str, haystack: list, provider: str = "mock") -> tuple[
 
 
 # ---------------------------------------------------------------------------
+# v0.2 engine helpers
+# ---------------------------------------------------------------------------
+
+_LEGACY_DECISION = {
+    Status.CONFLICT: "block", Status.UNCERTAIN: "review",
+    Status.PASS: "pass", Status.UNKNOWN: "pass",
+}
+
+
+def _make_guard(conn, provider: str, use_ner: bool) -> StateGuard:
+    verifier = None
+    if provider and provider != "mock":
+        verifier = LLMVerifier(provider)
+    return StateGuard(
+        SQLiteFactStore(conn),
+        resolver=HeuristicEntityResolver(single_entity_default=use_ner),
+        verifier=verifier,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Run one row through the chosen mode
 # ---------------------------------------------------------------------------
 
@@ -224,10 +250,12 @@ def run_row(conn, row: dict, dim: str, mode: str,
     query = row["probing_queries"][dim]
     haystack = row["haystack_session"]
 
-    t0 = time.perf_counter()
-
+    # Seeding the store is setup, not interception: keep it out of latency.
     entity, attribute, old_value, new_value = seed_db(conn, row)
     known_entity = None if use_ner else entity
+    expected = "stale" if dim == "dim2_query" else "neutral"
+
+    t0 = time.perf_counter()
 
     # dim1 (SR) and dim3 (IPA) queries do NOT carry a stale premise the
     # pipeline should intercept — "correct" for them means the pipeline
@@ -252,6 +280,8 @@ def run_row(conn, row: dict, dim: str, mode: str,
             "dim":         DIM_LABELS[dim],
             "mode":        mode,
             "status":      l1.status.value,
+            "decision":    _LEGACY_DECISION[l1.status],
+            "expected":    expected,
             "intercepted": intercepted,
             "correct":     correct,
             "latency_ms":  round(latency_ms, 2),
@@ -286,6 +316,8 @@ def run_row(conn, row: dict, dim: str, mode: str,
             "dim":             DIM_LABELS[dim],
             "mode":            mode,
             "status":          final_status.value,
+            "decision":        _LEGACY_DECISION[final_status],
+            "expected":        expected,
             "l1_resolved":     l1_resolved,
             "intercepted":     intercepted,
             "corrected_query": corrected,
@@ -293,6 +325,31 @@ def run_row(conn, row: dict, dim: str, mode: str,
             "parse_error":     parse_error,
             "latency_ms":      round(latency_ms, 2),
             "tokens_used":     tokens_used,
+        }
+
+    # ── Mode: v0.2 StateGuard engine (PASS / REVIEW / BLOCK) ────────────────
+    if mode == "guard":
+        guard = _make_guard(conn, provider, use_ner)
+        resp = guard.check(CheckRequest(query, entity_ids=None if use_ner else [entity]))
+        latency_ms = (time.perf_counter() - t0) * 1000
+        intercepted = resp.decision is Decision.BLOCK
+        return {
+            "uid":             row["uid"],
+            "type":            row["type"],
+            "dim":             DIM_LABELS[dim],
+            "mode":            mode,
+            "status":          resp.decision.value.upper(),
+            "decision":        resp.decision.value,
+            "expected":        expected,
+            "intercepted":     intercepted,
+            "corrected_query": resp.suggested_query,
+            "correct":         _score(intercepted),
+            "reason":          resp.reason,
+            "parse_error":     any(e.kind is EvidenceKind.PROVIDER_ERROR for e in resp.evidence),
+            "covered":         not any(e.kind is EvidenceKind.UNRESOLVED_ENTITY
+                                       for e in resp.evidence),
+            "latency_ms":      round(latency_ms, 2),
+            "tokens_used":     resp.tokens_used,
         }
 
     # ── Mode: baseline (no interceptor, raw LLM) ────────────────────────────
@@ -352,8 +409,9 @@ def summarise(results: list[dict]) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="StateGuard STALE harness")
     parser.add_argument(
-        "--mode", choices=["l1", "l1l2", "baseline"], default="l1",
-        help="Ablation mode: l1=Layer1 only, l1l2=full pipeline, baseline=raw LLM"
+        "--mode", choices=["l1", "l1l2", "guard", "baseline"], default="l1",
+        help="l1=v0.1 Layer1, l1l2=v0.1 L1+L2, guard=v0.2 engine "
+             "(add --provider for its verifier), baseline=raw LLM"
     )
     parser.add_argument(
         "--provider", choices=["gemini", "openai", "groq", "mock"], default="mock",
@@ -386,6 +444,7 @@ def main():
 
     # Load dataset
     print("Loading STALEproj/STALE …")
+    from datasets import load_dataset
     dataset = load_dataset("STALEproj/STALE")
     rows    = dataset[args.split]
     if args.limit:
@@ -443,6 +502,23 @@ def main():
                    "n_rows": len(rows), "dims": args.dims,
                    "summary": summary}, f, indent=2)
     print(f"[OK] Summary saved -> {json_path}")
+
+    # ── Balanced scorecard (PASS/REVIEW/BLOCK view) ──────────────────────────
+    scored = [r for r in results if r.get("decision") and r.get("expected")]
+    if scored:
+        for r in scored:
+            r["latency_ms"] = r.get("latency_ms")
+            r["tokens"] = r.get("tokens_used", 0)
+            r["error"] = bool(r.get("parse_error"))
+            r["type_dim"] = f"{r['type']}_{r['dim']}"
+        cards = {"ALL": scorecard(scored), **by_group(scored, "type_dim")}
+        print()
+        print(format_table(cards, "Balanced scorecard (dim2/PR = stale, dim1/dim3 = neutral)"))
+        with open(json_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        payload["scorecard"] = cards
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
 
     # ── Print summary table ───────────────────────────────────────────────────
     print(f"\n{'Type+Dim':<12} {'N':>5} {'Accuracy':>10} {'Avg Lat ms':>12} {'Tokens':>8}")
