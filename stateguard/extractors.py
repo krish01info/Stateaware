@@ -50,17 +50,19 @@ PERSON_PROFILE: dict[str, str] = {
     "meal": "diet", "recipe": "diet", "restaurant": "diet", "cuisine": "diet",
     "dinner": "diet", "lunch": "diet", "breakfast": "diet", "snack": "diet",
     "menu": "diet", "dish": "diet", "cook": "diet", "order food": "diet",
+    "khana": "diet", "khaana": "diet", "nashta": "diet",
     # location
     "location": "location", "city": "location", "live in": "location",
     "lives in": "location", "living in": "location", "based in": "location",
     "neighborhood": "location", "neighbourhood": "location", "commute": "location",
     "nearby": "location", "near me": "location", "local": "location",
     "around here": "location", "my area": "location",
+    "shehar": "location", "sheher": "location", "paas mein": "location",
     # job
     "job": "job", "work as": "job", "works as": "job", "occupation": "job",
     "role": "job", "profession": "job", "career": "job", "office": "job",
     "employer": "job", "workplace": "job", "coworker": "job", "colleague": "job",
-    "boss": "job", "company": "job",
+    "boss": "job", "company": "job", "naukri": "job", "kaam": "job", "office mein": "job",
     # misc person attributes
     "age": "age", "years old": "age", "birthday": "age",
     "language": "language", "speak": "language",
@@ -133,7 +135,10 @@ class KeywordAttributeExtractor:
 # Query explicitly says the value is past/changed -> it is not *assuming* it.
 _HISTORY_STRONG = ["used to", "previously", "formerly", "no longer", "not anymore",
                    "anymore", "back when", "in the past", "switched from", "moved from",
-                   "changed from", "went from", "gave up", "stopped being", "quit"]
+                   "changed from", "went from", "gave up", "stopped being", "quit",
+                   # Hinglish
+                   "pehle", "ab nahi", "ab nahin", "chhod diya", "chod diya",
+                   "band kar diya", "pehle tha", "pehle thi"]
 # Weaker signals of talking about the past (plain past tense, "my old ...").
 _HISTORY_WEAK = ["my old", "my previous", "my former", "old", "before", "lived", "was",
                  "were", "had been", "worked as", "used", "earlier"]
@@ -141,19 +146,29 @@ _HISTORY_WEAK = ["my old", "my previous", "my former", "old", "before", "lived",
 _CONTRAST = ["instead of", "rather than", "compared to", "compared with", "versus", "vs",
              "difference between", "switch from", "switching from", "move from",
              "moving from", "transition from", "go from", "now that", "changed between",
-             "what changed"]
+             "what changed",
+             # Hinglish
+             "ki jagah", "ke bajaye", "ke badle", "ab toh"]
 # Query looks forward -> e.g. revisiting an old city is not a stale premise.
 _FUTURE = ["going to", "next week", "next month", "next year", "plan to", "planning to",
-           "visiting", "trip to", "back to", "return to", "returning to", "flying to"]
+           "visiting", "trip to", "back to", "return to", "returning to", "flying to",
+           # Hinglish
+           "agle hafte", "agle mahine", "agle saal", "jaunga", "jaungi", "jaane wala",
+           "jaane wali", "ghoomne"]
 # Query asks what the state is (retrieval), rather than presupposing it.
 _DIRECT_Q = re.compile(
     r"^\s*(what(?:'s|\s+is|\s+are|\s+was)|where\s+(?:do|does|is|am)|who\s+(?:is|are)|"
     r"remind\s+me|do\s+you\s+(?:remember|know)|what\s+do\s+you\s+know|tell\s+me\s+about)\b"
-    r"|\b(currently|right\s+now|these\s+days|at\s+the\s+moment|any\s*more|still|yet)\b",
+    r"|\b(currently|right\s+now|these\s+days|at\s+the\s+moment|any\s*more|still|yet)\b"
+    r"|\b(abhi\s+bhi|ab\s+bhi|kya\s+(?:main|mai|mera|meri|mere)\b)",
     re.IGNORECASE)
 # Negation directly attached to the stale mention ("not vegetarian").
 _NEGATION = ["not", "no", "never", "isn t", "isnt", "aren t", "arent", "don t", "dont",
-             "doesn t", "doesnt", "non"]
+             "doesn t", "doesnt", "non", "nahi", "nahin", "mat"]
+
+
+# Negators that come AFTER the word they negate (Hindi / Hinglish).
+_POSTPOSED_NEGATION = {"nahi", "nahin", "mat"}
 
 
 @dataclass
@@ -179,10 +194,14 @@ def premise_frame(query: str) -> PremiseFrame:
         direct_question=bool(_DIRECT_Q.search(query)),
     )
     toks = tokenize(query)
-    neg = {n for n in _NEGATION if " " not in n}
-    for i, t in enumerate(toks[:-1]):
-        if t.norm in neg:
+    neg = {n for n in _NEGATION if " " not in n} - _POSTPOSED_NEGATION
+    for i, t in enumerate(toks):
+        if t.norm in neg and i + 1 < len(toks):
+            # English-style: negation precedes what it negates ("not vegetarian").
             f.negated_spans.append((toks[i + 1].start, toks[min(i + 3, len(toks) - 1)].end))
+        elif t.norm in _POSTPOSED_NEGATION and i > 0:
+            # Hindi-style: negation follows it ("vegetarian nahi hai").
+            f.negated_spans.append((toks[max(i - 2, 0)].start, toks[i - 1].end))
     return f
 
 

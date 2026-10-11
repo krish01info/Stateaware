@@ -151,6 +151,18 @@ class StateGuard:
             self.refresh_implications(entity_id, attribute, scope=fv.scope, reason=kw.get("reason"))
         return fv
 
+    def check_tool_call(self, name: str, arguments: dict,
+                        entity_ids: Optional[list[str]] = None, *,
+                        arg_map: Optional[dict[str, str]] = None,
+                        scope: Optional[str] = None) -> CheckResponse:
+        """Check an agent's tool call before it runs. See :mod:`stateguard.tools`.
+
+        On BLOCK, ``suggested_arguments`` holds the call with superseded
+        values replaced by current ones.
+        """
+        from .tools import check_tool_call
+        return check_tool_call(self, name, arguments, entity_ids, arg_map, scope)
+
     def observe(self, entity_id: str, message: str, *, valid_from: Optional[str] = None,
                 min_confidence: float = 0.6, subject: Optional[str] = None) -> ObserveResult:
         """Learn facts from a message the entity (usually the user) wrote.
@@ -275,7 +287,8 @@ class StateGuard:
             cur_m = [m for m in mentions if _same(m.value, cur.value)]
             stale_m = [m for m in mentions if not _same(m.value, cur.value)]
             base = dict(entity_id=ent.entity_id, attribute=attr, current_value=cur.value,
-                        previous_value=past[0].value if past else None)
+                        previous_value=past[0].value if past else None,
+                        changed_at=cur.valid_from if past else None)
 
             for m in stale_m:
                 depth = next(i for i, p in enumerate(past, 1) if _same(p.value, m.value))

@@ -1,6 +1,6 @@
 """StateGuard – pre-hoc interception of stale-state premises.
 
-Stable public API (v0.4):
+Stable public API (v0.5):
 
     from stateguard import StateGuard, CheckRequest, Decision
     guard = StateGuard()
@@ -25,13 +25,14 @@ from .implications import (CachedImplicationProvider, Implication, ImplicationPr
 from .store import ImplicationStore
 from .extraction import ExtractedFact, FactExtractor, LLMFactExtractor
 from .guard import ObserveResult, StateGuard
+from .chat import GuardedChat, clarification, memory_note
 
 # v0.1 API (legacy)
 from .db import init_db, upsert_fact, get_current_fact, get_supersession_context, list_facts
 from .layer1 import check, Status, InterceptResult, Conflict
 from .layer2 import check_l2
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "StateGuard", "CheckRequest", "CheckResponse", "Decision", "Evidence", "EvidenceKind",
@@ -42,6 +43,7 @@ __all__ = [
     "ImplicationProvider", "LLMImplicationProvider", "StaticImplicationProvider",
     "CachedImplicationProvider", "Implication", "ImplicationSet", "ImplicationStore",
     "FactExtractor", "LLMFactExtractor", "ExtractedFact", "ObserveResult",
+    "GuardedChat", "clarification", "memory_note",
     # legacy
     "init_db", "upsert_fact", "get_current_fact", "get_supersession_context", "list_facts",
     "check", "Status", "InterceptResult", "Conflict", "check_l2",

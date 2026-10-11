@@ -95,6 +95,8 @@ class Evidence:
     source: str = "layer1"
     score: float = 0.0                        # strength in [0, 1]
     note: Optional[str] = None
+    changed_at: Optional[str] = None          # when the current value took effect
+    argument: Optional[str] = None            # tool-call argument path, if any
 
 
 @dataclass
@@ -106,6 +108,7 @@ class CheckResponse:
     evidence: list[Evidence] = field(default_factory=list)
     suggested_query: Optional[str] = None
     reason: Optional[str] = None
+    suggested_arguments: Optional[dict[str, Any]] = None   # tool calls only
     layers_used: list[str] = field(default_factory=list)
     tokens_used: int = 0
     latency_ms: float = 0.0
