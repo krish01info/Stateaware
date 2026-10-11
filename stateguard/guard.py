@@ -46,6 +46,8 @@ from .normalize import STOPWORDS, Mention, SynonymTable, find_mentions, normaliz
 from .resolvers import EntityResolver, HeuristicEntityResolver, ResolvedEntity
 from .store import FactStore, InMemoryFactStore
 from .verifier import Verifier
+from .implications import ImplicationProvider
+from .store import ImplicationStore
 
 # Score caps applied by premise framing. Kept as named constants so the paper
 # can report them and ablations can vary them.
@@ -58,6 +60,8 @@ UNCUED_GENERIC = 0.65     # single lowercase word, no attribute cue ("monthly")
 CAP_FUTURE = 0.45         # "visiting Seattle next month"
 CAP_DIRECT_Q = 0.45       # "is Alice still vegetarian?"
 IMPLICIT_SCORE = 0.4      # attribute touched, no value named
+IMPLIED_SCORE = 0.7       # names a write-time implication of the change ("paneer" for vegan)
+IMPLIED_CUED_SCORE = 0.8  # ... and also touches the attribute ("paneer RECIPE")
 IMPLICIT_SCORE_DIRECT_Q = 0.1
 
 
@@ -81,6 +85,10 @@ class StateGuard:
                          deterministic layer cannot judge implicit premises,
                          and flagging every one would make REVIEW meaningless.
     max_verifications  : cap on Layer-2 calls per query (cost control).
+    implications       : optional :class:`ImplicationProvider`. When set,
+                         :meth:`remember` asks it once per new value which
+                         phrases the change rules out, and :meth:`check`
+                         matches those phrases deterministically.
     """
 
     def __init__(
@@ -96,6 +104,7 @@ class StateGuard:
         verifier_threshold: float = 0.7,
         implicit_without_verifier: Decision = Decision.PASS,
         max_verifications: int = 2,
+        implications: Optional[ImplicationProvider] = None,
     ) -> None:
         self.store = store if store is not None else InMemoryFactStore()
         self.resolver = resolver or HeuristicEntityResolver()
@@ -107,12 +116,66 @@ class StateGuard:
         self.verifier_threshold = verifier_threshold
         self.implicit_without_verifier = implicit_without_verifier
         self.max_verifications = max_verifications
+        self.implications = implications
+        # Write-time cost accounting, so papers/dashboards can report it.
+        self.write_tokens = 0
+        self.write_calls = 0
+        self.write_errors: list[str] = []
+        # Fallback for stores that do not implement ImplicationStore.
+        self._impl_mem: dict[tuple, tuple[str, list[tuple[str, str]]]] = {}
 
     # ------------------------------------------------------------------ write
 
     def remember(self, entity_id: str, attribute: str, value: str, **kw) -> FactVersion:
-        """Record a fact; a different value supersedes the current one."""
-        return self.store.record(entity_id, attribute, value, **kw)
+        """Record a fact; a different value supersedes the current one.
+
+        If an implication provider is configured and this is a new value,
+        the provider is called once and its phrases are stored with the fact.
+        """
+        fv = self.store.record(entity_id, attribute, value, **kw)
+        if self.implications is not None and not self._get_impl(entity_id, attribute, fv.scope):
+            self.refresh_implications(entity_id, attribute, scope=fv.scope, reason=kw.get("reason"))
+        return fv
+
+    def refresh_implications(self, entity_id: str, attribute: str,
+                             scope: Optional[str] = None, reason: Optional[str] = None) -> int:
+        """(Re)generate implications for the current value. Returns phrase count."""
+        if self.implications is None:
+            raise ValueError("no implication provider configured")
+        cur = [f for f in self.store.current(entity_id, attribute) if f.scope == scope]
+        if not cur:
+            return 0
+        cur = cur[0]
+        hist = self.store.history(entity_id, attribute, scope)
+        previous: list[str] = []
+        for h in hist:
+            if not h.is_current and not _same(h.value, cur.value) \
+                    and not any(_same(h.value, p) for p in previous):
+                previous.append(h.value)
+        res = self.implications.implications(entity_id, attribute, cur.value, previous,
+                                             reason or cur.reason)
+        self.write_calls += 1
+        self.write_tokens += res.tokens_used
+        if res.error:
+            self.write_errors.append(f"{entity_id}.{attribute}: {res.error}")
+            return 0
+        phrases = [(i.phrase, i.kind) for i in res.items]
+        if isinstance(self.store, ImplicationStore):
+            self.store.set_implications(entity_id, attribute, cur.value, phrases, scope)
+        else:
+            self._impl_mem[(entity_id, attribute, scope)] = (cur.value, phrases)
+        return len(phrases)
+
+    def _get_impl(self, entity_id: str, attribute: str, scope: Optional[str]
+                  ) -> list[tuple[str, str]]:
+        if isinstance(self.store, ImplicationStore):
+            return self.store.get_implications(entity_id, attribute, scope)
+        out = []
+        for f in self.store.current(entity_id, attribute, scope):
+            rec = self._impl_mem.get((entity_id, attribute, f.scope))
+            if rec and rec[0] == f.value:
+                out += rec[1]
+        return out
 
     # ------------------------------------------------------------------ check
 
@@ -147,10 +210,15 @@ class StateGuard:
                          frame: PremiseFrame):
         current = self.store.current(ent.entity_id, scope=scope)
         changed: dict[str, list[FactVersion]] = {}
+        implied: dict[str, list[tuple[str, str]]] = {}
         for fact in current:
             hist = self.store.history(ent.entity_id, fact.attribute, scope)
             if any(not h.is_current and not _same(h.value, fact.value) for h in hist):
                 changed[fact.attribute] = hist
+            phrases = self._get_impl(ent.entity_id, fact.attribute, scope)
+            if phrases:
+                implied[fact.attribute] = phrases
+                changed.setdefault(fact.attribute, hist)
         if not changed:
             return
         cues = self.extractor.cues(query, changed.keys())
@@ -175,11 +243,30 @@ class StateGuard:
                                versions_back=depth, score=round(score * ent.confidence, 4),
                                note=note, **base), hist
 
-            if not stale_m:
+            # Write-time implications: phrases the current value rules out.
+            impl_m = []
+            if attr in implied:
+                used = [(m.start, m.end) for m in mentions]
+                kinds = {normalize(p): k for p, k in implied[attr]}
+                for m in find_mentions(query, [p for p, _ in implied[attr]], self.synonyms,
+                                       partial_min_tokens=99):
+                    if any(a < m.end and m.start < b for a, b in used):
+                        continue
+                    impl_m.append(m)
+                    score, notes = (IMPLIED_CUED_SCORE, ["names an implication of the change; "
+                                                         "attribute cue present"]) \
+                        if attr in cues else (IMPLIED_SCORE, ["names an implication of the change"])
+                    score, note = self._apply_caps(score, notes, m, bool(cur_m), frame)
+                    kind = kinds.get(normalize(m.value), "conflicts_with_current")
+                    yield Evidence(kind=EvidenceKind.IMPLIED_CONFLICT, assumed_value=m.value,
+                                   score=round(score * ent.confidence, 4),
+                                   note=f"{note} [{kind}]", **base), hist
+
+            if not stale_m and not impl_m and attr in changed and len(hist) > 1:
                 if cur_m:
                     yield Evidence(kind=EvidenceKind.CURRENT_VALUE, assumed_value=cur.value,
                                    score=0.0, note="query uses the current value", **base), hist
-                elif attr in cues:
+                elif attr in cues and past:
                     s = IMPLICIT_SCORE_DIRECT_Q if frame.direct_question else IMPLICIT_SCORE
                     yield Evidence(kind=EvidenceKind.ATTRIBUTE_CUE, score=round(s * ent.confidence, 4),
                                    note="touches a changed attribute without naming a value",
@@ -204,9 +291,15 @@ class StateGuard:
             score = min(score + 0.05, 0.98)
             notes.append("attribute cue present")
 
+        return self._apply_caps(score, notes, m, names_current, frame)
+
+    @staticmethod
+    def _apply_caps(score: float, notes: list[str], m: Mention, names_current: bool,
+                    frame: PremiseFrame) -> tuple[float, str]:
+        """Cap a score by how the query frames the mentioned state."""
         caps = []
         if frame.negated_spans and is_negated(frame, m.start):
-            caps.append((CAP_NEGATED, "old value is negated"))
+            caps.append((CAP_NEGATED, "mention is negated"))
         if frame.contrast:
             caps.append((CAP_CONTRAST, "query contrasts old and new state"))
         elif names_current:
@@ -356,6 +449,9 @@ def _explain(e: Evidence) -> str:
         depth = "" if (e.versions_back or 1) == 1 else f" ({e.versions_back} versions ago)"
         return (f"query assumes {e.attribute}={e.assumed_value!r}{depth} for {e.entity_id}, "
                 f"but it is now {e.current_value!r}")
+    if e.kind is EvidenceKind.IMPLIED_CONFLICT:
+        return (f"query mentions {e.assumed_value!r}, which does not fit {e.entity_id}'s "
+                f"current {e.attribute} {e.current_value!r}")
     if e.kind is EvidenceKind.ATTRIBUTE_CUE:
         return (f"query depends on {e.entity_id}'s {e.attribute}, which changed to "
                 f"{e.current_value!r}")

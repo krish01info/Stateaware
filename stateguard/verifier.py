@@ -80,7 +80,7 @@ def build_context(query: str, entity_id: str, attribute: str,
         lines.append(f"  {i}. {f.value!r} [{tag}] from {f.valid_from}{why}")
     hints = [e for e in evidence if e.assumed_value]
     if hints:
-        lines.append("PHRASES IN THE REQUEST THAT MATCH STORED VALUES: "
+        lines.append("PHRASES IN THE REQUEST FLAGGED BY THE DETERMINISTIC LAYER: "
                      + ", ".join(sorted({repr(e.assumed_value) for e in hints})))
     lines += ["", f"REQUEST: {query}"]
     return "\n".join(lines)

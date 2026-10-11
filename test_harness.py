@@ -59,7 +59,7 @@ def test_by_group():
 
 def test_fixtures_are_well_formed():
     rows = run_general.load(run_general.DEFAULT_FIXTURES)
-    assert len(rows) >= 50
+    assert len(rows) >= 70
     assert {r["expected"] for r in rows} == {"stale", "neutral"}
     assert len({r["domain"] for r in rows}) >= 8
     assert len({r["id"] for r in rows}) == len(rows)
@@ -90,3 +90,40 @@ def test_stale_runner_l1_has_decision():
     conn = init_db(":memory:")
     r = run_row(conn, FAKE_ROW, "dim2_query", "l1")
     assert r["decision"] in ("pass", "review", "block") and r["expected"] == "stale"
+
+
+def test_general_runner_with_implications(tmp_path, monkeypatch):
+    """Plumbing: implications flow from provider -> cache -> engine -> scorecard."""
+    import json as _json
+    from stateguard.implications import LLMImplicationProvider
+
+    def fake(system, user):
+        payload = {"conflicts_with_current": ["cheese", "milkshake"], "only_fits_previous": []} \
+            if "'vegan'" in user.split("CURRENT VALUE:")[1] else \
+            {"conflicts_with_current": [], "only_fits_previous": []}
+        return _json.dumps(payload), 100
+
+    real_init = LLMImplicationProvider.__init__
+    monkeypatch.setattr(LLMImplicationProvider, "__init__",
+                        lambda self, provider=None, **kw: real_init(self, complete_fn=fake))
+    cache = tmp_path / "impl.json"
+    out = run_general.main(["--out", str(tmp_path), "--implications", "fake",
+                            "--implications-cache", str(cache)])
+    assert out["write"]["calls"] > 0 and out["write"]["tokens"] > 0
+    assert cache.exists()
+    rows = _json.loads(next(tmp_path.glob("*impl-fake.json")).read_text())["rows"]
+    assert next(r for r in rows if r["id"] == "imp-01")["decision"] != "pass"
+    # second run is served from the cache: no new write tokens
+    out2 = run_general.main(["--out", str(tmp_path), "--implications", "cache-only",
+                             "--implications-cache", str(cache)])
+    assert out2["write"]["tokens"] == 0
+
+
+def test_stale_runner_with_implications():
+    from stateguard.implications import StaticImplicationProvider
+    impl = StaticImplicationProvider({("diet", "vegan"): {"conflicts_with_current": ["paneer"]}})
+    row = dict(FAKE_ROW, probing_queries=dict(FAKE_ROW["probing_queries"],
+                                              dim3_query="Share a paneer butter masala recipe."))
+    conn = init_db(":memory:")
+    r = run_row(conn, row, "dim3_query", "guard", implications=impl, ipa_label="stale")
+    assert r["decision"] != "pass" and r["expected"] == "stale" and r["correct"]

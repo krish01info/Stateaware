@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
-  <img src="https://img.shields.io/badge/version-0.2.0-informational" alt="v0.2.0">
+  <img src="https://img.shields.io/badge/version-0.3.0-informational" alt="v0.2.0">
 </p>
 
 ---
@@ -103,7 +103,43 @@ or low confidence becomes `REVIEW` with `provider_error` evidence and is
 **never** counted as "verified not stale". Any model can be plugged in with
 `LLMVerifier(complete_fn=...)`, including a local one.
 
-**4. Entity resolution is separate and visible.** Hosts should pass
+**4. Write-time implications: pay the LLM per fact change, not per query.**
+Layer 1 can only match words it knows. *"Paneer tikka recipe for Maya"*,
+after Maya went vegan, names no stored value, so it slips through. With an
+implication provider configured, `remember()` makes **one** cheap LLM call
+when a value changes and stores a short list of phrases next to that fact
+version:
+
+| List | Meaning | Example |
+|---|---|---|
+| `conflicts_with_current` | things the current value rules out | vegan → "paneer", "ghee"; role=viewer → "add new users" |
+| `only_fits_previous` | things that only make sense under an earlier value | Basic → Premium: "get rid of the ads", "can't watch in 4K" |
+
+At query time those phrases are matched like stored values: no LLM call,
+same ~2 ms, same framing caps (*"a vegan substitute for paneer"* passes).
+They are tied to the fact version, so they disappear the moment the value
+changes again. Facts change far less often than they are queried, so this
+moves model cost from the hot path to the write path.
+
+```python
+from stateguard import StateGuard
+from stateguard.implications import LLMImplicationProvider, CachedImplicationProvider
+
+guard = StateGuard(implications=CachedImplicationProvider(
+    LLMImplicationProvider("groq"), "implications.json"))
+guard.remember("maya", "diet", "vegetarian")
+guard.remember("maya", "diet", "vegan")          # one LLM call here
+guard.check("Paneer tikka recipe for Maya", ["maya"])   # no LLM call; BLOCK/REVIEW
+guard.write_tokens                                # write-time cost so far
+```
+
+The entity id is never sent to the model; only attribute and values are. The
+cache is keyed by attribute + values, so the same change is generated once
+across all users and every experiment can be re-run offline. Failed
+generations are recorded in `guard.write_errors` and simply leave the fact
+without implications.
+
+**5. Entity resolution is separate and visible.** Hosts should pass
 `entity_ids`. Without them, `HeuristicEntityResolver` matches entity IDs and
 aliases in the text, maps "my/I" to a configured `self_entity`, and otherwise
 reports `UNRESOLVED_ENTITY`. An unresolved request is `REVIEW` only if it
@@ -118,6 +154,7 @@ carries a premise matching some entity's superseded value. Otherwise it is
 | `EntityResolver` | `ExplicitEntityResolver`, `HeuristicEntityResolver` | NER, session-based lookup |
 | `AttributeExtractor` | `KeywordAttributeExtractor(PERSON_PROFILE, ACCOUNT_STATE)` | new domains: add a cue pack |
 | `Verifier` | `LLMVerifier("groq" \| "openai" \| "gemini" \| complete_fn=...)` | rule engines, local models |
+| `ImplicationProvider` | `LLMImplicationProvider`, `StaticImplicationProvider`, `CachedImplicationProvider` | curated domain rules |
 
 Value variants go in a `SynonymTable` (`{"NYC": "New York", "WFH": "work from home"}`).
 
@@ -131,30 +168,34 @@ verifier error rate, latency and tokens.
 
 ### General state-change suite
 
-56 cases over 8 domains (person profile, subscription, shipping address,
+70 cases over 8 domains (person profile, subscription, shipping address,
 account permission, device status, policy revision, product price,
 appointment) plus multi-update chains. Neutral cases are adversarial: they
-mention the entity or even the old value without assuming it.
+mention the entity, the old value, or words a stale request would use,
+without assuming the old state.
 
 ```bash
-python harness/run_general.py                       # Layer 1, entity IDs supplied
-python harness/run_general.py --resolver heuristic  # entity must be guessed
-python harness/run_general.py --provider groq       # + Layer-2 verifier
+python harness/run_general.py                          # Layer 1, entity IDs supplied
+python harness/run_general.py --resolver heuristic     # entity must be guessed
+python harness/run_general.py --implications groq      # + write-time implications (cached)
+python harness/run_general.py --implications cache-only  # rerun offline from the cache
+python harness/run_general.py --provider groq          # + Layer-2 verifier
 ```
 
 Layer 1 only, CPU, no LLM:
 
 | Setting | BLOCK prec. | Recall strict / lenient | FPR strict / lenient | Review rate | p50 latency |
 |---|---|---|---|---|---|
-| Entity IDs supplied | 0.95 | 0.79 / 0.83 | 0.03 / 0.22 | 0.12 | ~2 ms |
-| Entity guessed from text | 1.00 | 0.38 / 0.79 | 0.00 / 0.12 | 0.25 | ~2 ms |
-| IDs supplied, implicit → REVIEW | 0.95 | 0.79 / 0.88 | 0.03 / 0.31 | 0.20 | ~2 ms |
+| Entity IDs supplied | 0.90 | 0.59 / 0.62 | 0.05 / 0.21 | 0.10 | ~2 ms |
+| Entity guessed from text | 1.00 | 0.28 / 0.59 | 0.00 / 0.13 | 0.21 | ~2 ms |
+| IDs supplied, implicit → REVIEW | 0.90 | 0.59 / 0.69 | 0.05 / 0.29 | 0.17 | ~2 ms |
 
-What these say. Explicit stale premises are caught almost perfectly (18/18
-lenient, 17/18 strict). **Implicit** premises (*"Maya wants a paneer tikka
-recipe"* after she went vegan) are 0/4 without a verifier; that gap is exactly
-what Layer 2 is for. Guessing the entity costs most of the strict recall, so
-hosts should pass IDs.
+By category (IDs supplied): explicit stale premises 17/18 strict, 18/18
+lenient; multi-update chains 2/2; **implicit premises 0/12**. That 0/12 is
+the baseline write-time implications are meant to fix. Run
+`--implications groq` and report the change in implicit recall *and* in the
+`implicit_adversarial` false-positive rate side by side, with write-time
+tokens (`write.tokens` in the summary JSON) next to query-time tokens.
 
 > ⚠️ **These fixtures are a development set.** They were written alongside
 > the engine, and some rules were tuned while looking at them. Do not report
@@ -169,12 +210,17 @@ python harness/run_stale.py --mode l1                       # v0.1 Layer 1 (abla
 python harness/run_stale.py --mode guard                    # v0.2 engine, Layer 1 only
 python harness/run_stale.py --mode guard --provider groq    # v0.2 engine + verifier
 python harness/run_stale.py --mode guard --use-ner          # entity resolved from text
+python harness/run_stale.py --mode guard --implications groq --ipa-label stale
 python harness/run_stale.py --mode baseline --provider gemini
 ```
 
 Each run writes per-row CSV plus a summary JSON with the balanced scorecard,
-split by STALE type and dimension (PR queries count as stale; SR and IPA
-queries count as neutral). Seeding the fact store is excluded from latency.
+split by STALE type and dimension. PR queries count as stale and SR queries
+as neutral. IPA queries never name the old state but only have a correct
+answer under the new one, so whether an interceptor should flag them is a
+framing choice: `--ipa-label neutral` (default) or `stale`. Report both.
+Seeding the store and generating implications are excluded from query
+latency and reported as write-time cost.
 
 ## Project layout
 
@@ -186,6 +232,7 @@ stateguard/
   normalize.py   tokenising, money/synonym/plural normalisation, span-level value matching
   extractors.py  attribute cue packs + premise framing
   verifier.py    Layer-2 structured verifier (version-chain grounding, strict JSON)
+  implications.py write-time implication providers (LLM, static, cached)
   guard.py       StateGuard decision engine
   db.py, layer1.py, layer2.py   v0.1 API, kept for the original ablations
 harness/
@@ -205,11 +252,13 @@ pytest -q
 
 ## Known limitations
 
-- **Implicit premises need the verifier.** The deterministic layer only sees
-  values and cue words.
-- **Values the store has never held are invisible to Layer 1.** "Book a
-  steakhouse" for a vegan is a contradiction the store cannot match
-  deterministically.
+- **Implicit premises need implications or the verifier.** Without either,
+  the deterministic layer only sees stored values and cue words (0/12 on the
+  dev set). Implications are only as good as the phrases the model lists,
+  and users may phrase things differently.
+- **Old values used for someone else.** "Ask an admin to add users for
+  Ravi's team" mentions Ravi's old role about a different person and is
+  wrongly blocked.
 - **Word collisions.** A stored value that is an ordinary phrase ("30 days")
   can match unrelated text. Attribute cues and the generic-word rule reduce
   this but do not remove it.
