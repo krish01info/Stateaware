@@ -8,6 +8,7 @@ python harness/run_general.py                       # Layer 1 only, explicit ent
 python harness/run_general.py --resolver heuristic  # make StateGuard guess the entity
 python harness/run_general.py --provider groq       # add the Layer-2 verifier
 python harness/run_general.py --implicit review     # route implicit premises to REVIEW
+python harness/run_general.py --implications groq   # write-time implications (cached)
 
 The fixtures were written by the developers of this library. Treat them as
 a DEVELOPMENT set: report results on a held-out set written by someone who
@@ -27,22 +28,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from stateguard import (CheckRequest, Decision, EvidenceKind, HeuristicEntityResolver,
                         InMemoryFactStore, LLMVerifier, StateGuard)
 from harness.metrics import by_group, format_table, scorecard
+from stateguard.implications import CachedImplicationProvider, LLMImplicationProvider
 
 HERE = Path(__file__).parent
 DEFAULT_FIXTURES = HERE / "fixtures" / "general_state_cases.jsonl"
+DEFAULT_CACHE = HERE / "cache" / "implications.json"
 
 
 def load(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 
-def run_case(case: dict, args) -> dict:
+def make_implications(args):
+    """Implication provider for this run (cached, so reruns cost nothing)."""
+    if not args.implications:
+        return None
+    if args.implications == "cache-only":
+        inner = LLMImplicationProvider(complete_fn=_cache_miss)
+    else:
+        inner = LLMImplicationProvider(args.implications)
+    return CachedImplicationProvider(inner, args.implications_cache)
+
+
+def _cache_miss(system, user):
+    raise LookupError("not in implications cache (run once with a provider to fill it)")
+
+
+def run_case(case: dict, args, implications=None) -> dict:
     verifier = LLMVerifier(args.provider) if args.provider else None
     guard = StateGuard(
         InMemoryFactStore(),
         resolver=HeuristicEntityResolver(single_entity_default=False),
         verifier=verifier,
         implicit_without_verifier=Decision(args.implicit),
+        implications=implications,
     )
     for attr, value, ts in case["history"]:
         guard.remember(case["entity"], attr, value, valid_from=ts)
@@ -59,6 +78,8 @@ def run_case(case: dict, args) -> dict:
         "latency_ms": r.latency_ms, "tokens": r.tokens_used,
         "error": any(e.kind is EvidenceKind.PROVIDER_ERROR for e in r.evidence),
         "covered": not any(e.kind is EvidenceKind.UNRESOLVED_ENTITY for e in r.evidence),
+        "write_tokens": guard.write_tokens, "write_calls": guard.write_calls,
+        "write_errors": len(guard.write_errors),
         "query": case["query"],
     }
 
@@ -75,10 +96,14 @@ def main(argv=None):
     ap.add_argument("--provider", default=None, help="groq | openai | gemini (Layer 2)")
     ap.add_argument("--implicit", choices=["pass", "review"], default="pass",
                     help="decision for implicit premises when no verifier is set")
+    ap.add_argument("--implications", default=None,
+                    help="groq | openai | gemini | cache-only: generate write-time implications")
+    ap.add_argument("--implications-cache", type=Path, default=DEFAULT_CACHE)
     ap.add_argument("--out", type=Path, default=HERE / "results")
     args = ap.parse_args(argv)
 
-    rows = [run_case(c, args) for c in load(args.fixtures)]
+    impl = make_implications(args)
+    rows = [run_case(c, args, impl) for c in load(args.fixtures)]
     overall = scorecard(rows)
     print(format_table({"ALL": overall}, "Overall"))
     print()
@@ -96,7 +121,12 @@ def main(argv=None):
 
     args.out.mkdir(parents=True, exist_ok=True)
     tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    mode = f"general_{args.resolver}_{args.provider or 'l1'}_{args.implicit}"
+    mode = (f"general_{args.resolver}_{args.provider or 'l1'}_{args.implicit}"
+            f"_impl-{args.implications or 'none'}")
+    if impl is not None:
+        errs = sum(r["write_errors"] for r in rows)
+        print(f"\nWrite-time implications: {impl.misses} generated, {impl.hits} from cache, "
+              f"{overall.get('write', {}).get('tokens', 0)} tokens this run, {errs} errors")
     (args.out / f"{tag}_{mode}.json").write_text(json.dumps(
         {"mode": mode, "overall": overall, "by_domain": by_group(rows, "domain"),
          "by_category": by_group(rows, "category"), "rows": rows}, indent=2))

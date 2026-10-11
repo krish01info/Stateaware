@@ -97,6 +97,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS aliases ("
         " alias TEXT PRIMARY KEY, entity_name TEXT NOT NULL)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS implications ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " fact_id INTEGER NOT NULL REFERENCES facts(id),"
+        " phrase TEXT NOT NULL, kind TEXT NOT NULL)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_impl_fact ON implications(fact_id)")
     conn.commit()
 
 

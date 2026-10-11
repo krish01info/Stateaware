@@ -34,6 +34,7 @@ class EvidenceKind(str, Enum):
     STALE_VALUE = "stale_value"          # query names a superseded value
     CURRENT_VALUE = "current_value"      # query names the current value
     ATTRIBUTE_CUE = "attribute_cue"      # query touches a changed attribute, no value named
+    IMPLIED_CONFLICT = "implied_conflict"  # query names a write-time implication of the change
     UNRESOLVED_ENTITY = "unresolved_entity"
     VERIFIER = "verifier"                # produced by the Layer-2 verifier
     PROVIDER_ERROR = "provider_error"    # verifier failed / unparseable

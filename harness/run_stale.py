@@ -232,7 +232,8 @@ def _make_guard(conn, provider: str, use_ner: bool) -> StateGuard:
 # ---------------------------------------------------------------------------
 
 def run_row(conn, row: dict, dim: str, mode: str,
-            provider: str = "mock", use_ner: bool = False) -> dict:
+            provider: str = "mock", use_ner: bool = False, implications=None,
+            ipa_label: str = "neutral") -> dict:
     """
     Evaluate one (row, dim) pair.
     Returns a result dict with status, correct, latency_ms, tokens_used.
@@ -253,7 +254,11 @@ def run_row(conn, row: dict, dim: str, mode: str,
     # Seeding the store is setup, not interception: keep it out of latency.
     entity, attribute, old_value, new_value = seed_db(conn, row)
     known_entity = None if use_ner else entity
-    expected = "stale" if dim == "dim2_query" else "neutral"
+    # PR (dim2) always carries a stale premise. IPA (dim3) queries never name
+    # the old state but only have a correct answer under the new one; whether
+    # an interceptor *should* flag them is a framing choice, so it is a flag.
+    stale_dims = {"dim2_query"} | ({"dim3_query"} if ipa_label == "stale" else set())
+    expected = "stale" if dim in stale_dims else "neutral"
 
     t0 = time.perf_counter()
 
@@ -265,7 +270,7 @@ def run_row(conn, row: dict, dim: str, mode: str,
     # summarise(), so over-triggering (flagging everything as stale) was
     # invisible in the reported accuracy. See PR notes.
     def _score(intercepted: bool) -> bool:
-        return intercepted if dim == "dim2_query" else (not intercepted)
+        return intercepted if dim in stale_dims else (not intercepted)
 
     # ── Mode: L1 only ────────────────────────────────────────────────────────
     if mode == "l1":
@@ -330,6 +335,11 @@ def run_row(conn, row: dict, dim: str, mode: str,
     # ── Mode: v0.2 StateGuard engine (PASS / REVIEW / BLOCK) ────────────────
     if mode == "guard":
         guard = _make_guard(conn, provider, use_ner)
+        if implications is not None:
+            # Write-time step: paid once per fact change, excluded from query latency.
+            guard.implications = implications
+            guard.refresh_implications(entity, attribute)
+            t0 = time.perf_counter()
         resp = guard.check(CheckRequest(query, entity_ids=None if use_ner else [entity]))
         latency_ms = (time.perf_counter() - t0) * 1000
         intercepted = resp.decision is Decision.BLOCK
@@ -350,6 +360,8 @@ def run_row(conn, row: dict, dim: str, mode: str,
                                        for e in resp.evidence),
             "latency_ms":      round(latency_ms, 2),
             "tokens_used":     resp.tokens_used,
+            "write_tokens":    guard.write_tokens,
+            "write_calls":     guard.write_calls,
         }
 
     # ── Mode: baseline (no interceptor, raw LLM) ────────────────────────────
@@ -430,6 +442,13 @@ def main():
              "Without this flag, entity-resolution accuracy is never tested."
     )
     parser.add_argument(
+        "--ipa-label", choices=["neutral", "stale"], default="neutral",
+        help="score IPA (dim3) queries as should-pass (default) or should-intercept")
+    parser.add_argument(
+        "--implications", default=None,
+        help="guard mode: groq | openai | gemini — generate write-time implications "
+             "(cached in harness/cache/implications.json)")
+    parser.add_argument(
         "--limit", type=int, default=None,
         help="Limit number of rows (for quick smoke tests)"
     )
@@ -453,6 +472,12 @@ def main():
 
     # Use in-memory DB — each row gets a fresh seed
     # (For large runs you could reuse a persistent DB and clear between rows)
+    impl = None
+    if args.implications:
+        from stateguard.implications import CachedImplicationProvider, LLMImplicationProvider
+        impl = CachedImplicationProvider(LLMImplicationProvider(args.implications),
+                                         Path(__file__).parent / "cache" / "implications.json")
+
     results = []
     total   = len(rows) * len(args.dims)
     done    = 0
@@ -461,7 +486,8 @@ def main():
         conn = init_db(":memory:")   # fresh DB per row
         for dim in args.dims:
             try:
-                r = run_row(conn, row, dim, args.mode, args.provider, use_ner=args.use_ner)
+                r = run_row(conn, row, dim, args.mode, args.provider, use_ner=args.use_ner,
+                            implications=impl, ipa_label=args.ipa_label)
             except Exception as exc:
                 r = {
                     "uid":        row["uid"],
@@ -510,10 +536,13 @@ def main():
             r["latency_ms"] = r.get("latency_ms")
             r["tokens"] = r.get("tokens_used", 0)
             r["error"] = bool(r.get("parse_error"))
+            r.setdefault("write_tokens", 0)
+            r.setdefault("write_calls", 0)
             r["type_dim"] = f"{r['type']}_{r['dim']}"
         cards = {"ALL": scorecard(scored), **by_group(scored, "type_dim")}
         print()
-        print(format_table(cards, "Balanced scorecard (dim2/PR = stale, dim1/dim3 = neutral)"))
+        print(format_table(cards, f"Balanced scorecard (PR = stale, SR = neutral, "
+                                  f"IPA = {args.ipa_label})"))
         with open(json_path, encoding="utf-8") as f:
             payload = json.load(f)
         payload["scorecard"] = cards

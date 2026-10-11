@@ -135,11 +135,17 @@ def find_mentions(
     synonyms: Optional[SynonymTable] = None,
     partial_min_tokens: int = 3,
     partial_min_coverage: float = 0.6,
+    max_gap: int = 2,
 ) -> list[Mention]:
     """Find which of *values* the query mentions.
 
     Longest values are matched first and their spans are reserved, so a
     query naming "senior engineer" is not also counted as naming "engineer".
+
+    A value also matches exactly when all of its content words appear in
+    order with at most ``max_gap`` extra tokens in between ("can't I watch
+    in 4K" matches "can't watch in 4K"; "Tuesday at 10am" matches
+    "Tuesday 10am"). Values need at least two content words for this.
 
     Long free-text values (>= ``partial_min_tokens`` content tokens) can also
     match partially when enough of their content words appear; such matches
@@ -164,6 +170,8 @@ def find_mentions(
                     break
             if hit:
                 break
+        if not hit:
+            hit = _gapped(qn, taken, content_tokens(val), max_gap)
         if hit:
             i, j = hit
             for k in range(i, j):
@@ -178,6 +186,27 @@ def find_mentions(
             if cov >= partial_min_coverage:
                 found.append(Mention(val, q[idx[0]].start, q[idx[-1]].end, False, cov))
     return found
+
+
+def _gapped(qn: list[str], taken: list[bool], ct: list[str], max_gap: int):
+    """In-order match of content tokens *ct* allowing up to *max_gap* fillers."""
+    if len(ct) < 2 or max_gap <= 0:
+        return None
+    for i, tok in enumerate(qn):
+        if tok != ct[0] or taken[i]:
+            continue
+        k, j, gaps = 1, i + 1, 0
+        while k < len(ct) and j < len(qn) and gaps <= max_gap:
+            if taken[j]:
+                break
+            if qn[j] == ct[k]:
+                k += 1
+            elif qn[j] not in STOPWORDS:
+                gaps += 1
+            j += 1
+        if k == len(ct) and gaps <= max_gap:
+            return i, j
+    return None
 
 
 def phrase_present(query: str, phrase: str) -> Optional[tuple[int, int]]:

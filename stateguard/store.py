@@ -69,6 +69,23 @@ class FactStore(Protocol):
         ...
 
 
+@runtime_checkable
+class ImplicationStore(Protocol):
+    """Optional extension: stores write-time implications per current fact.
+
+    Stores that do not implement it still work; implications are then kept
+    only in the StateGuard instance's memory.
+    """
+
+    def set_implications(self, entity_id: str, attribute: str, value: str,
+                         phrases: list[tuple[str, str]], scope: Optional[str] = None) -> None: ...
+
+    def get_implications(self, entity_id: str, attribute: str,
+                         scope: Optional[str] = None) -> list[tuple[str, str]]:
+        """``[(phrase, kind)]`` for the CURRENT version only; [] if it changed since."""
+        ...
+
+
 # ---------------------------------------------------------------------------
 # In-memory adapter
 # ---------------------------------------------------------------------------
@@ -81,6 +98,7 @@ class InMemoryFactStore:
         self._versions: dict[tuple[str, str, Optional[str]], list[FactVersion]] = {}
         self._aliases: dict[str, str] = {}
         self._entities: dict[str, None] = {}
+        self._impl: dict[tuple, tuple[str, str, list[tuple[str, str]]]] = {}
 
     def record(self, entity_id, attribute, value, *, reason=None, valid_from=None,
                source=None, confidence=1.0, scope=None) -> FactVersion:
@@ -123,6 +141,19 @@ class InMemoryFactStore:
 
     def aliases(self) -> dict[str, str]:
         return dict(self._aliases)
+
+    def set_implications(self, entity_id, attribute, value, phrases, scope=None) -> None:
+        cur = [f for f in self.current(entity_id, attribute) if f.scope == scope]
+        if cur and cur[0].value == value:
+            self._impl[(entity_id, attribute, scope)] = (value, cur[0].valid_from, list(phrases))
+
+    def get_implications(self, entity_id, attribute, scope=None) -> list[tuple[str, str]]:
+        out = []
+        for f in self.current(entity_id, attribute, scope):
+            rec = self._impl.get((entity_id, attribute, f.scope))
+            if rec and rec[0] == f.value and rec[1] == f.valid_from:
+                out += rec[2]
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -231,3 +262,30 @@ class SQLiteFactStore:
     def aliases(self) -> dict[str, str]:
         return {r["alias"]: r["entity_name"]
                 for r in self.conn.execute("SELECT alias, entity_name FROM aliases")}
+
+    def _current_fact_id(self, entity_id, attribute, scope) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT f.id, f.value FROM facts f JOIN entities e ON e.id = f.entity_id "
+            "WHERE e.name=? AND f.attribute=? AND f.is_current=1 AND f.scope IS ?",
+            (entity_id, attribute, scope)).fetchone()
+        return row
+
+    def set_implications(self, entity_id, attribute, value, phrases, scope=None) -> None:
+        row = self._current_fact_id(entity_id, attribute, scope)
+        if not row or row["value"] != value:
+            return
+        self.conn.execute("DELETE FROM implications WHERE fact_id=?", (row["id"],))
+        self.conn.executemany(
+            "INSERT INTO implications (fact_id, phrase, kind) VALUES (?,?,?)",
+            [(row["id"], p, k) for p, k in phrases])
+        self.conn.commit()
+
+    def get_implications(self, entity_id, attribute, scope=None) -> list[tuple[str, str]]:
+        sql = ("SELECT i.phrase, i.kind FROM implications i JOIN facts f ON f.id = i.fact_id "
+               "JOIN entities e ON e.id = f.entity_id "
+               "WHERE e.name=? AND f.attribute=? AND f.is_current=1")
+        args: list = [entity_id, attribute]
+        if scope is not None:
+            sql += " AND (f.scope IS NULL OR f.scope = ?)"
+            args.append(scope)
+        return [(r["phrase"], r["kind"]) for r in self.conn.execute(sql + " ORDER BY i.id", args)]

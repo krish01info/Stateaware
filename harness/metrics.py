@@ -75,6 +75,11 @@ def scorecard(records: list[dict]) -> dict:
         }
     tok = [r.get("tokens", 0) or 0 for r in records]
     out["tokens"] = {"total": sum(tok), "mean": round(statistics.fmean(tok), 2) if tok else 0}
+    if records and "write_tokens" in records[0]:
+        # Write-time cost (implication generation) is paid per fact change,
+        # not per query; report it separately so the two are never mixed.
+        out["write"] = {"tokens": sum(r.get("write_tokens", 0) for r in records),
+                        "calls": sum(r.get("write_calls", 0) for r in records)}
     return out
 
 
